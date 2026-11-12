@@ -1,0 +1,404 @@
+name: Deploy FilmCraft to Cloudflare Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. 扩容 10GB 虚拟内存，避免 Fat LTO 链接时 OOM (Exit Code 143)
+      - name: Expand Swap Space (Fix OOM Exit Code 143)
+        run: |
+          echo "=== 扩容前内存状况 ==="
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== 扩容后内存状况 ==="
+          free -h
+
+      # 2. 安装 Rust 工具链与 Wasm 目标平台
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # 3. Rust 依赖与编译缓存加速
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 4. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 包装器
+      - name: Install Modern Binaryen & Setup SIMD Wrapper
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          
+          sudo mv /usr/local/bin/wasm-opt /usr/local/bin/wasm-opt-raw
+          printf '#!/bin/bash\nexec /usr/local/bin/wasm-opt-raw --all-features --enable-simd "$@"\n' | sudo tee /usr/local/bin/wasm-opt > /dev/null
+          sudo chmod +x /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      # 5. 准备简体中文字体包 (CRAFT_FONTS_DIR) 并锁定默认语言为 ZhCn (zh-cn)
+      - name: Setup Simplified Chinese Font and Patch Default Language to ZhCn
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/craft-fonts" crates/craft-i18n apps/craft-i18n
+          git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts" || true
+
+          if [ ! -f "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt" ]; then
+            echo "未获取到官方 craft-fonts，使用 DroidSansFallbackFull.ttf 构建 Hans 简体中文字体包..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fonts-droid-fallback
+            TTF_PATH=$(find /usr/share/fonts -name "DroidSansFallback*.ttf" | head -n 1)
+            if [ -z "$TTF_PATH" ]; then
+              echo "❌ 未找到中文字体文件"
+              exit 1
+            fi
+            mkdir -p "$GITHUB_WORKSPACE/craft-fonts/fonts"
+            cp "$TTF_PATH" "$GITHUB_WORKSPACE/craft-fonts/fonts/ChineseUI.ttf"
+            printf "Noto Sans SC | Regular | fonts/ChineseUI.ttf | Hans\n" > "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
+          fi
+          echo "=== 字体清单内容 ==="
+          cat "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
+
+          cat << 'PYEOF' > patch_zh_cn.py
+          import os, re
+
+          # 1. 配置根 Cargo.toml 极致体积压缩 Profile
+          cargo_file = "Cargo.toml"
+          if os.path.exists(cargo_file):
+              with open(cargo_file, "r", encoding="utf-8") as f:
+                  lines = f.readlines()
+              filtered = []
+              skip = False
+              for line in lines:
+                  if line.strip().startswith("[profile.release"):
+                      skip = True
+                      continue
+                  if skip and line.strip().startswith("["):
+                      skip = False
+                  if not skip:
+                      filtered.append(line)
+
+              opt_profile = (
+                  "\n[profile.release]\n"
+                  'opt-level = "z"\n'
+                  'lto = "fat"\n'
+                  "codegen-units = 1\n"
+                  'panic = "abort"\n'
+                  "strip = true\n"
+                  "debug = 0\n"
+              )
+              filtered.append(opt_profile)
+              with open(cargo_file, "w", encoding="utf-8") as f:
+                  f.writelines(filtered)
+              print("✅ Cargo.toml Fat LTO 配置完成")
+
+          # 2. 修改 crates/text/build.rs：允许 wasm32 保留 Hans 简体中文字体
+          text_build = "crates/text/build.rs"
+          if os.path.exists(text_build):
+              with open(text_build, "r", encoding="utf-8") as f:
+                  bc = f.read()
+              bc_new = re.sub(
+                  r'fn\s+wasm_keeps\s*\([^)]*\)\s*->\s*bool\s*\{[^}]*\}',
+                  'fn wasm_keeps(_family: &str, style: &str) -> bool {\n    style == "Regular"\n}',
+                  bc,
+                  flags=re.DOTALL
+              )
+              if bc_new != bc:
+                  with open(text_build, "w", encoding="utf-8") as f:
+                      f.write(bc_new)
+                  print("✅ 已放开 crates/text/build.rs 中 wasm32 Hans 字体打包限制")
+
+          # 3. 拦截 AppLanguage::current()，默认返回 AppLanguage::ZhCn
+          app_lang_rs = "crates/app/src/language.rs"
+          if os.path.exists(app_lang_rs):
+              with open(app_lang_rs, "r", encoding="utf-8") as f:
+                  lc = f.read()
+              lc_new = re.sub(
+                  r'fn\s+detect\s*\([^)]*\)\s*->\s*Self\s*\{[^}]*\}',
+                  'fn detect() -> Self {\n        Self::ZhCn\n    }',
+                  lc,
+                  flags=re.DOTALL
+              )
+              if lc_new != lc:
+                  with open(app_lang_rs, "w", encoding="utf-8") as f:
+                      f.write(lc_new)
+                  print("✅ language.rs: detect() 已硬编码默认返回 ZhCn")
+
+          # 4. 前端 index.html 注入：清理缓存并锁定语言为 zh-cn
+          for root, _, files in os.walk("apps"):
+              for file in files:
+                  if file == "index.html":
+                      target_html = os.path.join(root, file)
+                      with open(target_html, "r", encoding="utf-8") as f:
+                          html = f.read()
+
+                      hook_script = (
+                          "<script>\n"
+                          "(function() {\n"
+                          "  try {\n"
+                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                          "    if (localStorage.getItem('filmcraft_zh_cn_v1') !== 'true') {\n"
+                          "      localStorage.clear();\n"
+                          "      sessionStorage.clear();\n"
+                          "      if (window.indexedDB && indexedDB.databases) {\n"
+                          "        indexedDB.databases().then(function(dbs) {\n"
+                          "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
+                          "        }).catch(function() {});\n"
+                          "      }\n"
+                          "      localStorage.setItem('filmcraft_zh_cn_v1', 'true');\n"
+                          "    }\n"
+                          "    ['filmcraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
+                          "      localStorage.setItem(k, 'zh-cn');\n"
+                          "    });\n"
+                          "  } catch(e) {}\n"
+                          "})();\n"
+                          "</script>\n"
+                      )
+                      if "<head>" in html and "filmcraft_zh_cn_v1" not in html:
+                          html = html.replace("<head>", "<head>\n" + hook_script)
+                          with open(target_html, "w", encoding="utf-8") as f:
+                              f.write(html)
+                          print(f"✅ 已在 {target_html} 注入 zh-CN 重定向与清库脚本")
+          PYEOF
+
+          python3 patch_zh_cn.py
+          rm -f patch_zh_cn.py
+
+      # 6. 编译 filmcraft-web Wasm 产物
+      - name: Build FilmCraft WebAssembly Application
+        env:
+          CARGO_BUILD_JOBS: 2
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: |
+          mkdir -p dist/web
+
+          rm -rf target/wasm32-unknown-unknown/release/build/filmcraft-* \
+                 target/wasm32-unknown-unknown/release/.fingerprint/filmcraft-* \
+                 target/wasm32-unknown-unknown/release/filmcraft_web* || true
+
+          WBG_VER=$(python3 -c '
+          import re
+          with open("Cargo.lock", "r", encoding="utf-8") as f:
+              txt = f.read()
+          m = re.search(r"\[\[package\]\]\s*name = \"wasm-bindgen\"\s*version = \"([^\"]+)\"", txt)
+          print(m.group(1) if m else "")
+          ')
+          echo "检测到 Cargo.lock 锁定的 wasm-bindgen 版本: $WBG_VER"
+
+          if [ -n "$WBG_VER" ]; then
+            curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
+              || curl -fsSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
+              || true
+            if [ -f wbg.tar.gz ]; then
+              tar -xzf wbg.tar.gz
+              sudo cp wasm-bindgen-*/wasm-bindgen /usr/local/bin/
+              rm -rf wbg.tar.gz wasm-bindgen-*
+            else
+              cargo install wasm-bindgen-cli --version "$WBG_VER" --locked
+            fi
+          fi
+          wasm-bindgen --version
+
+          cargo build -p filmcraft-web --target wasm32-unknown-unknown --release
+
+          WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -n 1)
+          echo "定位到编译生成的 Wasm: $WASM_FILE"
+          if [ -z "$WASM_FILE" ]; then
+            echo "❌ 未找到编译生成的 .wasm 文件"
+            exit 1
+          fi
+
+          cp -r apps/filmcraft-web/web/* dist/web/
+
+          OUT_NAME=$(python3 -c '
+          import re
+          with open("dist/web/index.html", "r", encoding="utf-8") as f:
+              html = f.read()
+          m = re.search(r"[\"\x27]\./([^\"\x27]+)\.js[\"\x27]", html)
+          print(m.group(1) if m else "filmcraft_web")
+          ')
+          echo "目标 JS/Wasm 输出前缀: $OUT_NAME"
+
+          wasm-bindgen --target web --out-dir dist/web --out-name "$OUT_NAME" "$WASM_FILE"
+
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/web/
+
+      # 7. 深度优化 wasm 并采用 Gzip 预压缩 + 浏览器原生流式解压
+      - name: Compress Wasm & Inject Native Streaming Decompression
+        run: |
+          echo "=== 开始对 WASM 进行 wasm-opt 优化与 Gzip 极限预压缩 ==="
+          cat << 'PYEOF' > optimize_and_compress.py
+          import os, glob, subprocess, json, gzip, re
+
+          wasm_files = glob.glob("dist/web/**/*.wasm", recursive=True)
+          if not wasm_files:
+              wasm_files = glob.glob("dist/**/*.wasm", recursive=True)
+
+          if not wasm_files:
+              print("❌ dist 目录下未找到任何 wasm 文件")
+              exit(1)
+
+          for wasm_path in wasm_files:
+              wasm_dir = os.path.dirname(wasm_path)
+              wasm_filename = os.path.basename(wasm_path)
+              print(f"\n--- 正在深度优化: {wasm_filename} ---")
+
+              # 1. wasm-opt 极致精简
+              cmd = [
+                  "/usr/local/bin/wasm-opt-raw",
+                  "--all-features",
+                  "--enable-simd",
+                  "-Oz",
+                  "--strip-debug",
+                  "--strip-producers",
+                  wasm_path,
+                  "-o",
+                  wasm_path
+              ]
+              try:
+                  subprocess.run(cmd, check=True)
+                  raw_size = os.path.getsize(wasm_path)
+                  print(f"wasm-opt 优化完成，当前体积: {raw_size/(1024*1024):.2f} MB")
+              except Exception as e:
+                  print(f"wasm-opt 优化跳过: {e}")
+                  raw_size = os.path.getsize(wasm_path)
+
+              # 2. 物理 Gzip 极速预压缩
+              gz_filename = wasm_filename + ".gz"
+              gz_path = os.path.join(wasm_dir, gz_filename)
+              with open(wasm_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=9) as f_out:
+                  f_out.writelines(f_in)
+
+              gz_size = os.path.getsize(gz_path)
+              gz_size_mb = gz_size / (1024 * 1024)
+              print(f"Gzip 压缩完成: {gz_filename}，压缩后体积: {gz_size_mb:.2f} MB (原大小: {raw_size/(1024*1024):.2f} MB)")
+
+              # 3. 检查压缩后体积是否满足 Cloudflare Pages 25MB 上限
+              chunks = []
+              max_safe_limit = 24.0 * 1024 * 1024
+              if gz_size > max_safe_limit:
+                  print(f"⚠️ 压缩后文件仍为 {gz_size_mb:.2f} MB (> 24MB)，进行极简两切片...")
+                  chunk_size = 14 * 1024 * 1024
+                  with open(gz_path, "rb") as f:
+                      gz_data = f.read()
+                  for i in range(0, len(gz_data), chunk_size):
+                      part_name = f"{gz_filename}.part{len(chunks)}"
+                      part_path = os.path.join(wasm_dir, part_name)
+                      with open(part_path, "wb") as pf:
+                          pf.write(gz_data[i:i+chunk_size])
+                      chunks.append(part_name)
+                      print(f"  生成切片: {part_name} ({len(gz_data[i:i+chunk_size])/(1024*1024):.2f} MB)")
+                  os.remove(gz_path)
+              else:
+                  chunks = [gz_filename]
+                  print(f"✅ 压缩后体积 {gz_size_mb:.2f} MB <= 24MB，无需分片，直接作为单文件发布！")
+
+              # 删除未压缩的大文件，避免触发 CF 25MB 限制
+              os.remove(wasm_path)
+              print(f"✅ 已清除原始未压缩文件: {wasm_filename}")
+
+              # 4. 改造 index.html，注入支持版本号参数的原生流式解压加载器
+              html_path = os.path.join(wasm_dir, "index.html")
+              if os.path.exists(html_path):
+                  with open(html_path, "r", encoding="utf-8") as f:
+                      html = f.read()
+
+                  html = re.sub(r'<link[^>]*rel="preload"[^>]*\.wasm[^>]*>', '', html)
+
+                  parts_json = json.dumps(chunks)
+                  fast_loader = (
+                      "<script>\n"
+                      "(function() {\n"
+                      "  var origFetch = window.fetch;\n"
+                      "  var targetWasm = '" + wasm_filename + "';\n"
+                      "  var gzFiles = " + parts_json + ";\n"
+                      "  window.fetch = async function() {\n"
+                      "    var args = Array.prototype.slice.call(arguments);\n"
+                      "    var raw = args[0];\n"
+                      "    var url = typeof raw === 'string' ? raw : (raw && (raw.href || raw.url) ? (raw.href || raw.url) : String(raw || ''));\n"
+                      "    if (url.indexOf(targetWasm) !== -1) {\n"
+                      "      console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');\n"
+                      "      var cleanUrl = url.split('?')[0].split('#')[0];\n"
+                      "      var basePath = cleanUrl.substring(0, cleanUrl.lastIndexOf('/') + 1);\n"
+                      "      var buffers = await Promise.all(gzFiles.map(function(f) {\n"
+                      "        return origFetch(basePath + f).then(function(r) {\n"
+                      "          if (!r.ok) throw new Error('下载失败: ' + f);\n"
+                      "          return r.arrayBuffer();\n"
+                      "        });\n"
+                      "      }));\n"
+                      "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);\n"
+                      "      var mergedGz = new Uint8Array(total);\n"
+                      "      var offset = 0;\n"
+                      "      for (var i = 0; i < buffers.length; i++) {\n"
+                      "        mergedGz.set(new Uint8Array(buffers[i]), offset);\n"
+                      "        offset += buffers[i].byteLength;\n"
+                      "      }\n"
+                      "      var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));\n"
+                      "      return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/wasm' } });\n"
+                      "    }\n"
+                      "    return origFetch.apply(this, args);\n"
+                      "  };\n"
+                      "})();\n"
+                      "</script>\n"
+                  )
+
+                  if "<head>" in html:
+                      html = html.replace("<head>", "<head>\n" + fast_loader)
+                  else:
+                      html = fast_loader + "\n" + html
+
+                  with open(html_path, "w", encoding="utf-8") as f:
+                      f.write(html)
+                  print("✅ index.html 已更新为流式管道解压引擎")
+
+          # 5. 生成 Cloudflare Pages _headers 强缓存规则文件
+          headers_content = (
+              "/*\n"
+              "  Access-Control-Allow-Origin: *\n\n"
+              "/*.wasm.gz\n"
+              "  Content-Type: application/gzip\n"
+              "  Cache-Control: public, max-age=31536000, immutable\n\n"
+              "/*.part*\n"
+              "  Content-Type: application/octet-stream\n"
+              "  Cache-Control: public, max-age=31536000, immutable\n\n"
+              "/*.wasm\n"
+              "  Content-Type: application/wasm\n"
+              "  Cache-Control: public, max-age=31536000, immutable\n\n"
+              "/*.js\n"
+              "  Cache-Control: public, max-age=31536000, immutable\n\n"
+              "/*.css\n"
+              "  Cache-Control: public, max-age=31536000, immutable\n"
+          )
+          with open("dist/web/_headers", "w", encoding="utf-8") as f:
+              f.write(headers_content)
+          print("✅ 已生成 Cloudflare Pages _headers 强缓存配置文件")
+          PYEOF
+
+          python3 optimize_and_compress.py
+          rm -f optimize_and_compress.py
+
+          echo "=== 最终提交部署的文件列表（全部 <= 24MB） ==="
+          ls -lh dist/web/
+
+      # 8. 部署发布到 Cloudflare Pages (lotelf-pr)
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist/web --project-name=lotelf-pr --branch=main --commit-dirty=true
