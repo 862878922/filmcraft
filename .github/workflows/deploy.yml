@@ -99,16 +99,17 @@ jobs:
                   if not os.path.exists(alias_dir):
                       shutil.copytree(zh_hans_dir, alias_dir)
 
-          # 3. 全面重定向 crates/ui-egui 下的默认语言与 wasm32 系统探测至 zh-hans
-          for root, _, files in os.walk("crates/ui-egui/src"):
+          # 3. 扫描 crates/ 下所有非测试源码，锁定默认语言与 wasm32 探测为 zh-hans
+          for root, _, files in os.walk("crates"):
+              if "test" in root:
+                  continue
               for file in files:
-                  if file.endswith(".rs") and "test" not in file and "test" not in root:
+                  if file.endswith(".rs") and "test" not in file:
                       path = os.path.join(root, file)
                       with open(path, "r", encoding="utf-8") as f:
                           c = f.read()
                       orig = c
 
-                      # 替换 Lang::EN 默认回退与 wasm32 空探测
                       c = re.sub(
                           r'\.unwrap_or\(\s*Lang::EN\s*\)',
                           '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
@@ -126,7 +127,6 @@ jobs:
                           c,
                           flags=re.DOTALL
                       )
-                      # 替换首选项默认语言字段
                       c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
                       c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
                       c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
@@ -153,7 +153,7 @@ jobs:
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_hans_v1') !== 'true') {\n"
+                          "    if (localStorage.getItem('filmcraft_zh_hans_v2') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
                           "      if (window.indexedDB && indexedDB.databases) {\n"
@@ -161,7 +161,7 @@ jobs:
                           "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
                           "        }).catch(function() {});\n"
                           "      }\n"
-                          "      localStorage.setItem('filmcraft_zh_hans_v1', 'true');\n"
+                          "      localStorage.setItem('filmcraft_zh_hans_v2', 'true');\n"
                           "    }\n"
                           "    ['filmcraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
                           "      localStorage.setItem(k, 'zh-hans');\n"
@@ -170,7 +170,7 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "filmcraft_zh_hans_v1" not in html:
+                      if "<head>" in html and "filmcraft_zh_hans_v2" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
@@ -188,7 +188,6 @@ jobs:
         run: |
           mkdir -p dist/web
 
-          # 提取 Cargo.lock 中锁定的 wasm-bindgen 精确版本
           WBG_VER=$(python3 -c '
           import re
           with open("Cargo.lock", "r", encoding="utf-8") as f:
@@ -198,7 +197,6 @@ jobs:
           ')
           echo "检测到 Cargo.lock 锁定的 wasm-bindgen 版本: $WBG_VER"
 
-          # 安装对应版本的 wasm-bindgen-cli
           if [ -n "$WBG_VER" ]; then
             curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
               || curl -fsSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
@@ -213,7 +211,6 @@ jobs:
           fi
           wasm-bindgen --version
 
-          # 编译 filmcraft-web 的 wasm32 release 产物
           cargo build -p filmcraft-web --target wasm32-unknown-unknown --release
 
           WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -n 1)
@@ -223,44 +220,23 @@ jobs:
             exit 1
           fi
 
-          # 复制静态前端资源（index.html, audio-worklet.js, favicon.png 等）到 dist/web/
           cp -r apps/filmcraft-web/web/* dist/web/
 
-          # 自动识别 index.html 中引用的 JS 模块名并生成对应胶水代码
           OUT_NAME=$(python3 -c '
-          import re, os
-          html_path = "dist/web/index.html"
-          with open(html_path, "r", encoding="utf-8") as f:
+          import re
+          with open("dist/web/index.html", "r", encoding="utf-8") as f:
               html = f.read()
-          m = re.search(r"from\s+[\"\x27]\./([^\"\x27]+)\.js[\"\x27]", html)
-          if m:
-              print(m.group(1))
-          else:
-              print("filmcraft_web")
+          m = re.search(r"[\"\x27]\./([^\"\x27]+)\.js[\"\x27]", html)
+          print(m.group(1) if m else "filmcraft_web")
           ')
           echo "目标 JS/Wasm 输出前缀: $OUT_NAME"
 
           wasm-bindgen --target web --out-dir dist/web --out-name "$OUT_NAME" "$WASM_FILE"
 
-          # 若 index.html 尚未包含模块启动脚本，自动追加初始化脚本
-          python3 -c '
-          import os
-          out_name = os.environ.get("OUT_NAME", "filmcraft_web")
-          html_path = "dist/web/index.html"
-          with open(html_path, "r", encoding="utf-8") as f:
-              html = f.read()
-          if f"{out_name}.js" not in html:
-              boot = f"\n<script type=\"module\">\nimport init from \"./{out_name}.js\";\ninit();\n</script>\n"
-              html = html.replace("</body>", boot + "</body>") if "</body>" in html else html + boot
-              with open(html_path, "w", encoding="utf-8") as f:
-                  f.write(html)
-              print(f"✅ 已在 index.html 注入 {out_name}.js 启动脚本")
-          ' OUT_NAME="$OUT_NAME"
-
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 7. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 25MB 限制）
+      # 7. 深度压缩 wasm 并执行强制切片（支持 string / URL / Request 拦截，保证单文件小于 20MB）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -331,10 +307,12 @@ jobs:
                           "  var parts = " + parts_json_str + ";",
                           "  window.fetch = async function() {",
                           "    var args = Array.prototype.slice.call(arguments);",
-                          "    var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');",
+                          "    var raw = args[0];",
+                          "    var url = typeof raw === 'string' ? raw : (raw && (raw.href || raw.url) ? (raw.href || raw.url) : String(raw || ''));",
                           "    if (url.indexOf(targetWasm) !== -1) {",
                           "      console.log('[ChunkLoader] 正在并发获取小分片并透明组装...');",
-                          "      var basePath = url.substring(0, url.lastIndexOf('/') + 1);",
+                          "      var cleanUrl = url.split('?')[0].split('#')[0];",
+                          "      var basePath = cleanUrl.substring(0, cleanUrl.lastIndexOf('/') + 1);",
                           "      var buffers = await Promise.all(parts.map(function(p) {",
                           "        return origFetch(basePath + p).then(function(r) {",
                           "          if (!r.ok) throw new Error('分片下载失败: ' + p);",
@@ -348,7 +326,7 @@ jobs:
                           "        merged.set(new Uint8Array(buffers[i]), offset);",
                           "        offset += buffers[i].byteLength;",
                           "      }",
-                          "      return new Response(merged, { headers: { 'Content-Type': 'application/wasm' } });",
+                          "      return new Response(merged, { status: 200, headers: { 'Content-Type': 'application/wasm' } });",
                           "    }",
                           "    return origFetch.apply(this, args);",
                           "  };",
