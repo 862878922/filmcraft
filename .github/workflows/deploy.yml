@@ -117,14 +117,16 @@ jobs:
                   s = f.read()
               orig_s = s
 
-              s = s.replace(
-                  "tags.iter().find_map(|tag| lang_from_tag(tag)).unwrap_or(Lang::EN)",
-                  'tags.iter().find_map(|tag| lang_from_tag(tag)).unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))'
+              s = re.sub(
+                  r'\.unwrap_or\(\s*Lang::EN\s*\)',
+                  '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
+                  s
               )
               s = re.sub(
-                  r'(#\[cfg\(all\(not\(test\),\s*target_arch\s*=\s*"wasm32"\)\)\]\s*fn\s+detect_system_tags\(\)\s*->\s*Vec<String>\s*\{\s*)Vec::new\(\)',
+                  r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
                   r'\1vec!["zh-hans".to_owned()]',
-                  s
+                  s,
+                  flags=re.DOTALL
               )
 
               if s != orig_s:
@@ -132,21 +134,22 @@ jobs:
                       f.write(s)
                   print("✅ 已修改 crates/ui-egui/src/i18n/system.rs：wasm32 默认解析为 zh-hans")
 
-          # 4. 修改 crates/ui-egui/src/i18n.rs 中的默认 Lang 实现
-          i18n_rs = "crates/ui-egui/src/i18n.rs"
-          if os.path.exists(i18n_rs):
-              with open(i18n_rs, "r", encoding="utf-8") as f:
-                  code = f.read()
+          # 4. 修改 i18n 模块入口（兼容 i18n.rs 与 i18n/mod.rs）中的默认 Lang 实现
+          for i18n_rs in ["crates/ui-egui/src/i18n.rs", "crates/ui-egui/src/i18n/mod.rs"]:
+              if os.path.exists(i18n_rs):
+                  with open(i18n_rs, "r", encoding="utf-8") as f:
+                      code = f.read()
 
-              new_code = re.sub(
-                  r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
-                  r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
-                  code
-              )
-              if new_code != code:
-                  with open(i18n_rs, "w", encoding="utf-8") as f:
-                      f.write(new_code)
-                  print("✅ 已修改 crates/ui-egui/src/i18n.rs：Lang::default() 指向 zh-hans")
+                  new_code = re.sub(
+                      r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
+                      r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
+                      code,
+                      flags=re.DOTALL
+                  )
+                  if new_code != code:
+                      with open(i18n_rs, "w", encoding="utf-8") as f:
+                          f.write(new_code)
+                      print(f"✅ 已修改 {i18n_rs}：Lang::default() 指向 zh-hans")
 
           # 5. 扫描 crates/ui-egui 下非测试源码，锁定默认语言首选项为 zh-hans
           for root, _, files in os.walk("crates/ui-egui/src"):
@@ -210,23 +213,36 @@ jobs:
           python3 patch_zh_hans.py
           rm -f patch_zh_hans.py
 
-      # 7. 传入 CRAFT_I18N_DIR 环境变量并执行 Web 构建
+      # 7. 进入 apps/filmcraft-web 目录执行 Trunk 构建，确保正确关联 Cargo.toml 与 Trunk.toml
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-          TARGET_HTML=$(find apps -name "index.html" | grep -v "boot" | head -n 1)
-          if [ -z "$TARGET_HTML" ]; then
-            TARGET_HTML=$(find apps -name "index.html" | head -n 1)
-          fi
-          if [ -z "$TARGET_HTML" ]; then
-            TARGET_HTML="index.html"
-          fi
-          echo "使用构建入口: $TARGET_HTML"
+          echo "=== 检查 apps/filmcraft-web 目录结构 ==="
+          ls -la apps/filmcraft-web/
 
-          trunk build "$TARGET_HTML" --release
+          if [ -f "apps/filmcraft-web/Trunk.toml" ]; then
+            echo "使用 apps/filmcraft-web/Trunk.toml 进行构建..."
+            (cd apps/filmcraft-web && trunk build --release)
+          elif [ -f "apps/filmcraft-web/index.html" ]; then
+            (cd apps/filmcraft-web && trunk build index.html --release)
+          elif [ -f "apps/filmcraft-web/web/index.html" ]; then
+            python3 - << 'EOF'
+            p = "apps/filmcraft-web/web/index.html"
+            with open(p, "r", encoding="utf-8") as f:
+                h = f.read()
+            if 'rel="rust"' in h and 'href=' not in h:
+                h = h.replace('rel="rust"', 'rel="rust" href="../Cargo.toml"')
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(h)
+            EOF
+            (cd apps/filmcraft-web && trunk build web/index.html --release)
+          else
+            TARGET_HTML=$(find apps -name "index.html" | head -n 1)
+            trunk build "$TARGET_HTML" --release
+          fi
           
           python3 - << 'EOF'
           import os, shutil, glob
