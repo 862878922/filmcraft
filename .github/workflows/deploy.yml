@@ -50,16 +50,100 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 5. 配置官方 zh-hans 简体中文词库并锁定默认语言为 zh-hans
-      - name: Configure Official zh-hans Locale and Patch Lang Resolution
+      # 5. 克隆官方词库与 craft-libs，本地 patch craft-i18n / craft-web-host 强制默认 zh-hans
+      - name: Patch craft-libs and Enforce Official zh-hans Locale
         run: |
-          rm -rf "$GITHUB_WORKSPACE/craft-i18n"
+          rm -rf "$GITHUB_WORKSPACE/craft-i18n" vendor_craft_libs
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
+          git clone https://github.com/storytold/craft-libs.git vendor_craft_libs
+          (
+            cd vendor_craft_libs
+            git checkout df469bb2bd2cc026ad25a34f65954ccbb46909d6 || true
+            git checkout 09dcbc225b95232998498a40ca56e24716571d53 -- crates/i18n || true
+          )
 
           cat << 'PYEOF' > patch_zh_hans.py
-          import os, re, shutil
+          import os, re, shutil, tomllib
 
-          # 1. 配置 Cargo.toml 极致体积压缩 Profile
+          # 1. 自动展开 vendor_craft_libs 中所有子 crate 的 .workspace = true 继承，消除 Cargo 解析报错
+          ws_toml_path = "vendor_craft_libs/Cargo.toml"
+          if os.path.exists(ws_toml_path):
+              with open(ws_toml_path, "rb") as f:
+                  ws_data = tomllib.load(f)
+              ws_pkg = ws_data.get("workspace", {}).get("package", {})
+              ws_deps = ws_data.get("workspace", {}).get("dependencies", {})
+
+              def toml_val(v):
+                  if isinstance(v, bool):
+                      return "true" if v else "false"
+                  if isinstance(v, str):
+                      return f'"{v}"'
+                  if isinstance(v, list):
+                      return "[" + ", ".join(toml_val(x) for x in v) + "]"
+                  if isinstance(v, dict):
+                      items = []
+                      for dk, dv in v.items():
+                          if dk == "path" and isinstance(dv, str) and not dv.startswith("vendor_craft_libs/"):
+                              dv = "vendor_craft_libs/" + dv
+                          items.append(f"{dk} = {toml_val(dv)}")
+                      return "{ " + ", ".join(items) + " }"
+                  return str(v)
+
+              crates_root = "vendor_craft_libs/crates"
+              if os.path.exists(crates_root):
+                  for cname in os.listdir(crates_root):
+                      ctoml = os.path.join(crates_root, cname, "Cargo.toml")
+                      if not os.path.exists(ctoml):
+                          continue
+                      with open(ctoml, "r", encoding="utf-8") as f:
+                          lines = f.readlines()
+                      out_lines = []
+                      section = ""
+                      for line in lines:
+                          s = line.strip()
+                          if s.startswith("[") and s.endswith("]"):
+                              section = s
+                              out_lines.append(line)
+                              continue
+                          m_ws = re.match(r'^([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$', s)
+                          m_inline = re.match(r'^([A-Za-z0-9_-]+)\s*=\s*\{([^}]*)\}\s*$', s)
+                          if m_ws:
+                              key = m_ws.group(1)
+                              if section == "[package]":
+                                  if key in ws_pkg:
+                                      out_lines.append(f"{key} = {toml_val(ws_pkg[key])}\n")
+                                  continue
+                              elif "dependencies" in section and key in ws_deps:
+                                  out_lines.append(f"{key} = {toml_val(ws_deps[key])}\n")
+                                  continue
+                          elif m_inline and "dependencies" in section and "workspace" in m_inline.group(2):
+                              key = m_inline.group(1)
+                              if key in ws_deps:
+                                  base = dict(ws_deps[key]) if isinstance(ws_deps[key], dict) else {"version": ws_deps[key]}
+                                  extra_str = m_inline.group(2)
+                                  for part in extra_str.split(","):
+                                      part = part.strip()
+                                      if "=" in part:
+                                          ek, ev = [x.strip() for x in part.split("=", 1)]
+                                          if ek != "workspace":
+                                              if ek == "features" and "features" in base and ev.startswith("["):
+                                                  extra_feats = [x.strip().strip('"').strip("'") for x in ev[1:-1].split(",") if x.strip()]
+                                                  base["features"] = list(dict.fromkeys(base["features"] + extra_feats))
+                                              else:
+                                                  if ev == "true":
+                                                      base[ek] = True
+                                                  elif ev == "false":
+                                                      base[ek] = False
+                                                  elif ev.startswith('"') and ev.endswith('"'):
+                                                      base[ek] = ev[1:-1]
+                                  out_lines.append(f"{key} = {toml_val(base)}\n")
+                                  continue
+                          out_lines.append(line)
+                      with open(ctoml, "w", encoding="utf-8") as f:
+                          f.writelines(out_lines)
+                  print("✅ 已展开 vendor_craft_libs 子 crate 工作区继承配置")
+
+          # 2. 配置根 Cargo.toml：Fat LTO + [patch] 重定向 craft-i18n 与 craft-web-host
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
@@ -85,11 +169,20 @@ jobs:
                   "debug = 0\n"
               )
               filtered.append(opt_profile)
+
+              patch_entries = []
+              if os.path.exists("vendor_craft_libs/crates/i18n/Cargo.toml"):
+                  patch_entries.append('craft-i18n = { path = "vendor_craft_libs/crates/i18n" }\n')
+              if os.path.exists("vendor_craft_libs/crates/web-host/Cargo.toml"):
+                  patch_entries.append('craft-web-host = { path = "vendor_craft_libs/crates/web-host" }\n')
+              if patch_entries:
+                  filtered.append('\n[patch."https://github.com/storytold/craft-libs"]\n' + "".join(patch_entries))
+
               with open(cargo_file, "w", encoding="utf-8") as f:
                   f.writelines(filtered)
-              print("✅ Cargo.toml Fat LTO 配置完成")
+              print("✅ Cargo.toml 已挂载本地 patch:", [x.split("=")[0].strip() for x in patch_entries])
 
-          # 2. 验证官方 zh-hans 词库并补充别名目录
+          # 3. 验证官方 zh-hans 词库并补充别名目录
           i18n_repo = os.environ.get("GITHUB_WORKSPACE", "") + "/craft-i18n"
           zh_hans_dir = os.path.join(i18n_repo, "locales", "zh-hans")
           if os.path.exists(zh_hans_dir):
@@ -99,47 +192,63 @@ jobs:
                   if not os.path.exists(alias_dir):
                       shutil.copytree(zh_hans_dir, alias_dir)
 
-          # 3. 扫描 crates/ 下所有非测试源码，锁定默认语言与 wasm32 探测为 zh-hans
-          for root, _, files in os.walk("crates"):
-              if "test" in root:
-                  continue
-              for file in files:
-                  if file.endswith(".rs") and "test" not in file:
-                      path = os.path.join(root, file)
-                      with open(path, "r", encoding="utf-8") as f:
-                          c = f.read()
-                      orig = c
+          # 4. 穿透修改 vendor_craft_libs、crates/ 与 apps/ 下的所有非测试 Rust 源码
+          def patch_rust_tree(base_dir):
+              if not os.path.exists(base_dir):
+                  return
+              for root, _, files in os.walk(base_dir):
+                  if "test" in root:
+                      continue
+                  for file in files:
+                      if file.endswith(".rs") and "test" not in file:
+                          path = os.path.join(root, file)
+                          with open(path, "r", encoding="utf-8") as f:
+                              c = f.read()
+                          orig = c
 
-                      c = re.sub(
-                          r'\.unwrap_or\(\s*Lang::EN\s*\)',
-                          '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
-                          c
-                      )
-                      c = re.sub(
-                          r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
-                          r'\1vec!["zh-hans".to_owned()]',
-                          c,
-                          flags=re.DOTALL
-                      )
-                      c = re.sub(
-                          r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
-                          r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
-                          c,
-                          flags=re.DOTALL
-                      )
-                      c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
-                      c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
-                      c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
-                      c = re.sub(r'(locale\s*:\s*Option<String>\s*=\s*)None', r'\1Some("zh-hans".into())', c)
-                      c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh-hans";')
-                      c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh-hans";')
+                          # 打印 craft-i18n 关键源码便于验证
+                          if "crates/i18n/src/" in path.replace("\\", "/"):
+                              print(f"\n--- {path} 关键片段 ---")
+                              for idx, ln in enumerate(c.splitlines()[:60], 1):
+                                  print(f"{idx}: {ln}")
 
-                      if c != orig:
-                          with open(path, "w", encoding="utf-8") as f:
-                              f.write(c)
-                          print(f"✅ 已锁定 zh-hans 默认语言: {path}")
+                          c = re.sub(
+                              r'\.unwrap_or\(\s*Lang::EN\s*\)',
+                              '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
+                              c
+                          )
+                          c = re.sub(
+                              r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
+                              r'\1vec!["zh-hans".to_owned()]',
+                              c,
+                              flags=re.DOTALL
+                          )
+                          c = re.sub(
+                              r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
+                              r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
+                              c,
+                              flags=re.DOTALL
+                          )
+                          c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
+                          c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
+                          c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
+                          c = re.sub(r'(locale\s*:\s*Option<String>\s*=\s*)None', r'\1Some("zh-hans".into())', c)
+                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh-hans";')
+                          c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh-hans";')
+                          if "web-host" in path or "filmcraft-web" in path:
+                              c = c.replace('"en-US"', '"zh-Hans"').replace('"en"', '"zh-hans"')
 
-          # 4. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
+                          if c != orig:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(c)
+                              print(f"✅ 已锁定 zh-hans 默认语言: {path}")
+
+          patch_rust_tree("vendor_craft_libs/crates/i18n")
+          patch_rust_tree("vendor_craft_libs/crates/web-host")
+          patch_rust_tree("crates")
+          patch_rust_tree("apps")
+
+          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-Hans，并在检测到旧 IndexedDB 时彻底清除后刷新一次
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -153,15 +262,22 @@ jobs:
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_hans_v2') !== 'true') {\n"
+                          "    if (localStorage.getItem('filmcraft_zh_hans_v3') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
+                          "      localStorage.setItem('filmcraft_zh_hans_v3', 'true');\n"
                           "      if (window.indexedDB && indexedDB.databases) {\n"
                           "        indexedDB.databases().then(function(dbs) {\n"
-                          "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
+                          "          if (dbs && dbs.length > 0) {\n"
+                          "            Promise.all(dbs.map(function(db) {\n"
+                          "              return new Promise(function(res) {\n"
+                          "                var req = indexedDB.deleteDatabase(db.name);\n"
+                          "                req.onsuccess = req.onerror = req.onblocked = res;\n"
+                          "              });\n"
+                          "            })).then(function() { location.reload(); });\n"
+                          "          }\n"
                           "        }).catch(function() {});\n"
                           "      }\n"
-                          "      localStorage.setItem('filmcraft_zh_hans_v2', 'true');\n"
                           "    }\n"
                           "    ['filmcraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
                           "      localStorage.setItem(k, 'zh-hans');\n"
@@ -170,11 +286,11 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "filmcraft_zh_hans_v2" not in html:
+                      if "<head>" in html and "filmcraft_zh_hans_v3" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
-                          print(f"✅ 已在 {target_html} 注入 zh-Hans 重定向与缓存清理脚本")
+                          print(f"✅ 已在 {target_html} 注入 zh-Hans 重定向与同步清库脚本")
           PYEOF
 
           python3 patch_zh_hans.py
