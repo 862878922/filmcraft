@@ -50,12 +50,11 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 5. 准备官方 zh-hans 词库（双路径挂载）并接管 craft-i18n / craft-web-host
+      # 5. 克隆官方词库与 craft-libs，在 craft-i18n 底层直接嵌入 zh-hans 词库并重定向查词
       - name: Patch craft-libs and Enforce Official zh-hans Locale
         run: |
-          rm -rf "$GITHUB_WORKSPACE/craft-i18n" "$GITHUB_WORKSPACE/../craft-i18n" vendor_craft_libs
+          rm -rf "$GITHUB_WORKSPACE/craft-i18n" vendor_craft_libs
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
-          cp -r "$GITHUB_WORKSPACE/craft-i18n" "$GITHUB_WORKSPACE/../craft-i18n"
 
           git clone https://github.com/storytold/craft-libs.git vendor_craft_libs
           (
@@ -184,74 +183,65 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml 已挂载本地 patch:", [x.split("=")[0].strip() for x in patch_entries])
 
-          # 3. 检查 build.rs 中多语言词库嵌入逻辑，确保构建脚本不会被缓存跳过
-          for root, _, files in os.walk("."):
-              if any(x in root for x in ["target", ".git", "craft-i18n"]):
-                  continue
-              for fn in files:
-                  if fn == "build.rs":
-                      bp = os.path.join(root, fn)
-                      with open(bp, "r", encoding="utf-8") as f:
-                          bc = f.read()
-                      if any(k in bc.lower() for k in ["i18n", "tsv", "catalog", "locale"]):
-                          print(f"\n=== 发现多语言相关 {bp} ===")
-                          for idx, ln in enumerate(bc.splitlines()[:120], 1):
-                              print(f"{idx}: {ln}")
-                      # 触摸 build.rs 强制 Cargo 重新执行编译脚本
-                      os.utime(bp, None)
-
-          # 4. 检查 vendor_craft_libs/crates/i18n/src/lib.rs 61-420 行结构并注入 zh-hans 默认语言
+          # 3. 修改 vendor_craft_libs/crates/i18n/src/lib.rs：
+          #    (a) 在 I18n::new 中直接嵌入官方 zh-hans/common.tsv 与 filmcraft.tsv，确保翻译数据非空
+          #    (b) 在 t / tc / get / tid / trn / trn_plain / trn_decimal 中将 Lang::EN 重定向至 zh-hans
           i18n_lib = "vendor_craft_libs/crates/i18n/src/lib.rs"
           if os.path.exists(i18n_lib):
               with open(i18n_lib, "r", encoding="utf-8") as f:
                   lib_code = f.read()
-              print("\n=== vendor_craft_libs/crates/i18n/src/lib.rs (61-390 行) ===")
-              for idx, ln in enumerate(lib_code.splitlines()[60:390], 61):
-                  print(f"{idx}: {ln}")
 
-              orig_lib = lib_code
-              # 将 resolve 默认回退 Lang::EN 重定向至 zh-hans
+              inject_catalogs = (
+                  '    pub fn new(embedded: &\'static Embedded, offered: &[&str]) -> (I18n, Vec<String>) {\n'
+                  '        const ZH_COMMON: &str = include_str!(concat!(env!("CRAFT_I18N_DIR"), "/locales/zh-hans/common.tsv"));\n'
+                  '        const ZH_APP: &str = include_str!(concat!(env!("CRAFT_I18N_DIR"), "/locales/zh-hans/filmcraft.tsv"));\n'
+                  '        let mut patched_embedded: Vec<(&\'static str, &\'static str, &\'static str)> = embedded\n'
+                  '            .iter()\n'
+                  '            .map(|&(c, s, a)| if c.eq_ignore_ascii_case("zh-hans") { (c, ZH_COMMON, ZH_APP) } else { (c, s, a) })\n'
+                  '            .collect();\n'
+                  '        if !patched_embedded.iter().any(|(c, _, _)| c.eq_ignore_ascii_case("zh-hans")) {\n'
+                  '            patched_embedded.push(("zh-hans", ZH_COMMON, ZH_APP));\n'
+                  '        }\n'
+                  '        let embedded = patched_embedded.as_slice();\n'
+              )
+              assert "pub fn new(embedded: &'static Embedded, offered: &[&str]) -> (I18n, Vec<String>) {\n" in lib_code, "未找到 I18n::new 签名"
+              lib_code = lib_code.replace(
+                  "pub fn new(embedded: &'static Embedded, offered: &[&str]) -> (I18n, Vec<String>) {\n",
+                  inject_catalogs,
+                  1
+              )
+
+              # 确保 zh-hans 的 offered 标志始终为 true
+              lib_code = lib_code.replace(
+                  "let offered = offered.iter().any(|o| o.eq_ignore_ascii_case(&code));",
+                  'let offered = code == "zh-hans" || offered.iter().any(|o| o.eq_ignore_ascii_case(&code));',
+                  1
+              )
+
+              # 将 match_tags 默认回退从 Lang::EN 改为 zh-hans
               lib_code = lib_code.replace(
                   "find_map(|t| self.match_tag(t)).unwrap_or(Lang::EN)",
-                  'find_map(|t| self.match_tag(t)).unwrap_or_else(|| self.match_tag("zh-hans").unwrap_or(Lang::EN))'
+                  'find_map(|t| self.match_tag(t)).unwrap_or_else(|| self.match_tag("zh-hans").unwrap_or(Lang::EN))',
+                  1
               )
-              # 拦截 I18n::new(embedded, lang) 以及所有接收 lang: Lang 的方法
-              def patch_lang_param(m):
+
+              # 匹配带或不带生命周期 &'a self 的全部 7 个核心翻译方法，将 Lang::EN 重定向到 zh-hans
+              def redirect_lookup(m):
                   sig = m.group(0)
-                  if "language_name" in sig:
-                      return sig
                   return sig + '\n        let lang = if lang == Lang::EN { self.match_tag("zh-hans").unwrap_or(lang) } else { lang };'
 
-              lib_code = re.sub(
-                  r'pub\s+fn\s+[a-zA-Z0-9_]+\s*(?:<[^>]+>)?\s*\(\s*&(?:mut\s+)?self\s*,\s*lang\s*:\s*Lang\b[^{]*\{',
-                  patch_lang_param,
+              lib_code, count = re.subn(
+                  r'pub\s+fn\s+(?:t|tc|get|tid|trn|trn_plain|trn_decimal)\b[^{]*\{',
+                  redirect_lookup,
                   lib_code
               )
-              lib_code = re.sub(
-                  r'(pub\s+fn\s+new\s*(?:<[^>]+>)?\s*\([^{]*\blang\s*:\s*Lang\b[^{]*\{)',
-                  r'\1\n        let lang = if lang == Lang::EN { embedded.match_tag("zh-hans").unwrap_or(lang) } else { lang };',
-                  lib_code
-              )
+              print(f"✅ 已在 {i18n_lib} 嵌入官方 zh-hans 词库并重定向 {count} 个查词方法")
+              assert count >= 7, f"预期替换 7 个查词方法，实际仅替换 {count} 个"
 
-              if lib_code != orig_lib:
-                  with open(i18n_lib, "w", encoding="utf-8") as f:
-                      f.write(lib_code)
-                  print("✅ 已在 vendor_craft_libs/crates/i18n/src/lib.rs 注入 zh-hans 构造与查词重定向")
+              with open(i18n_lib, "w", encoding="utf-8") as f:
+                  f.write(lib_code)
 
-          # 5. 检查 crates/ui-egui/src 中 I18n 初始化与语言选择逻辑
-          for root, _, files in os.walk("crates/ui-egui/src"):
-              for fn in files:
-                  if fn.endswith(".rs") and "test" not in fn:
-                      p = os.path.join(root, fn)
-                      with open(p, "r", encoding="utf-8") as f:
-                          txt = f.read()
-                      if "I18n::" in txt or "ui_language" in txt or "craft_i18n" in txt:
-                          print(f"\n=== {p} 中 I18n/语言调用片段 ===")
-                          for idx, ln in enumerate(txt.splitlines(), 1):
-                              if any(k in ln for k in ["I18n", "ui_language", "craft_i18n", "match_tag", "Lang::"]):
-                                  print(f"{idx}: {ln}")
-
-          # 6. 穿透修改 vendor_craft_libs、crates/ 与 apps/ 下的默认语言配置为 zh-hans
+          # 4. 锁定 crates/ui-egui、crates/engine 与 vendor_craft_libs 的默认语言配置为 zh-hans
           def patch_rust_tree(base_dir):
               if not os.path.exists(base_dir):
                   return
@@ -290,7 +280,7 @@ jobs:
           patch_rust_tree("crates")
           patch_rust_tree("apps")
 
-          # 7. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
+          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -304,10 +294,10 @@ jobs:
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_hans_v5') !== 'true') {\n"
+                          "    if (localStorage.getItem('filmcraft_zh_hans_v6') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
-                          "      localStorage.setItem('filmcraft_zh_hans_v5', 'true');\n"
+                          "      localStorage.setItem('filmcraft_zh_hans_v6', 'true');\n"
                           "      if (window.indexedDB && indexedDB.databases) {\n"
                           "        indexedDB.databases().then(function(dbs) {\n"
                           "          if (dbs && dbs.length > 0) {\n"
@@ -328,7 +318,7 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "filmcraft_zh_hans_v5" not in html:
+                      if "<head>" in html and "filmcraft_zh_hans_v6" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
@@ -338,19 +328,13 @@ jobs:
           python3 patch_zh_hans.py
           rm -f patch_zh_hans.py
 
-      # 6. 清除旧的 build.rs 产物缓存，重新编译 filmcraft-web Wasm 并打包
+      # 6. 编译 filmcraft-web Wasm 并匹配 Cargo.lock 版本的 wasm-bindgen 打包到 dist/web
       - name: Build FilmCraft WebAssembly Application
         env:
           CARGO_BUILD_JOBS: 2
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-
-          # 清理 filmcraft-* 与 craft-* 的旧 build.rs 缓存，确保重新扫描并嵌入 zh-hans 词库
-          rm -rf target/wasm32-unknown-unknown/release/build/filmcraft-* \
-                 target/wasm32-unknown-unknown/release/build/craft-* \
-                 target/wasm32-unknown-unknown/release/.fingerprint/filmcraft-* \
-                 target/wasm32-unknown-unknown/release/.fingerprint/craft-* || true
 
           WBG_VER=$(python3 -c '
           import re
