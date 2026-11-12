@@ -50,7 +50,7 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 5. 克隆官方词库与 craft-libs，本地 patch craft-i18n / craft-web-host 强制默认 zh-hans
+      # 5. 克隆官方词库与 craft-libs，在 craft-i18n 查词底层强制重定向至 zh-hans
       - name: Patch craft-libs and Enforce Official zh-hans Locale
         run: |
           rm -rf "$GITHUB_WORKSPACE/craft-i18n" vendor_craft_libs
@@ -192,7 +192,42 @@ jobs:
                   if not os.path.exists(alias_dir):
                       shutil.copytree(zh_hans_dir, alias_dir)
 
-          # 4. 穿透修改 vendor_craft_libs、crates/ 与 apps/ 下的所有非测试 Rust 源码
+          # 4. 精准修改 vendor_craft_libs/crates/i18n/src/lib.rs：
+          #    (a) 默认语言回退直接解析为 zh-hans
+          #    (b) 所有文本翻译查询方法在收到 Lang::EN 时自动使用 zh-hans 目录
+          i18n_lib = "vendor_craft_libs/crates/i18n/src/lib.rs"
+          if os.path.exists(i18n_lib):
+              with open(i18n_lib, "r", encoding="utf-8") as f:
+                  lib_code = f.read()
+              orig_lib = lib_code
+
+              lib_code = lib_code.replace(
+                  "find_map(|t| self.match_tag(t)).unwrap_or(Lang::EN)",
+                  'find_map(|t| self.match_tag(t)).unwrap_or_else(|| self.match_tag("zh-hans").unwrap_or(Lang::EN))'
+              )
+
+              def redirect_en_lookup(m):
+                  sig = m.group(0)
+                  if re.search(r'\blang\s*:\s*Lang\b', sig):
+                      return sig + '\n        let lang = if lang == Lang::EN { self.match_tag("zh-hans").unwrap_or(lang) } else { lang };'
+                  return sig
+
+              lib_code = re.sub(
+                  r'pub\s+fn\s+(?:get|get_in|trn|trn_in|trn_plain|trn_plain_in)\b[^{]*\{',
+                  redirect_en_lookup,
+                  lib_code
+              )
+
+              if lib_code != orig_lib:
+                  with open(i18n_lib, "w", encoding="utf-8") as f:
+                      f.write(lib_code)
+                  print("✅ 已在 vendor_craft_libs/crates/i18n/src/lib.rs 注入 zh-hans 默认解析与查词重定向")
+              else:
+                  print("⚠️ lib.rs 未匹配到预期签名，输出 330-450 行排查:")
+                  for idx, ln in enumerate(lib_code.splitlines()[329:450], 330):
+                      print(f"{idx}: {ln}")
+
+          # 5. 穿透修改 vendor_craft_libs、crates/ 与 apps/ 下的所有非测试 Rust 源码
           def patch_rust_tree(base_dir):
               if not os.path.exists(base_dir):
                   return
@@ -206,13 +241,6 @@ jobs:
                               c = f.read()
                           orig = c
 
-                          # 针对 craft-i18n 内部的 self.match_tag(...).unwrap_or(Lang::EN) 直接使用 self.match_tag("zh-hans")
-                          c = re.sub(
-                              r'(self\.match_tag\([^)]+\))\.unwrap_or\(\s*Lang::EN\s*\)',
-                              r'\1.unwrap_or_else(|| self.match_tag("zh-hans").unwrap_or(Lang::EN))',
-                              c
-                          )
-                          # 若当前文件作用域内定义了 lang_from_tag，则将剩余的 unwrap_or(Lang::EN) 重定向至 lang_from_tag("zh-hans")
                           if "lang_from_tag" in c:
                               c = re.sub(
                                   r'\.unwrap_or\(\s*Lang::EN\s*\)',
@@ -251,7 +279,7 @@ jobs:
           patch_rust_tree("crates")
           patch_rust_tree("apps")
 
-          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-Hans，并在检测到旧 IndexedDB 时彻底清除后刷新一次
+          # 6. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -265,10 +293,10 @@ jobs:
                           "  try {\n"
                           "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
                           "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_hans_v3') !== 'true') {\n"
+                          "    if (localStorage.getItem('filmcraft_zh_hans_v4') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
-                          "      localStorage.setItem('filmcraft_zh_hans_v3', 'true');\n"
+                          "      localStorage.setItem('filmcraft_zh_hans_v4', 'true');\n"
                           "      if (window.indexedDB && indexedDB.databases) {\n"
                           "        indexedDB.databases().then(function(dbs) {\n"
                           "          if (dbs && dbs.length > 0) {\n"
@@ -289,7 +317,7 @@ jobs:
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "filmcraft_zh_hans_v3" not in html:
+                      if "<head>" in html and "filmcraft_zh_hans_v4" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
