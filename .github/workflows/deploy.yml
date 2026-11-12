@@ -50,16 +50,30 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 5. 多路径挂载官方 zh-hans 词库并修复 crates/ui-egui 本地多语言模块
-      - name: Patch FilmCraft Local i18n and Enforce zh-hans
+      # 5. 准备简体中文字体包 (CRAFT_FONTS_DIR) 并锁定默认语言为 ZhCn (zh-cn)
+      - name: Setup Simplified Chinese Font and Patch Default Language to ZhCn
         run: |
-          rm -rf "$GITHUB_WORKSPACE/craft-i18n" crates/craft-i18n apps/craft-i18n
-          git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
-          cp -r "$GITHUB_WORKSPACE/craft-i18n" crates/craft-i18n
-          cp -r "$GITHUB_WORKSPACE/craft-i18n" apps/craft-i18n
+          rm -rf "$GITHUB_WORKSPACE/craft-fonts" crates/craft-i18n apps/craft-i18n
+          git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts" || true
 
-          cat << 'PYEOF' > patch_zh_hans.py
-          import os, re, shutil
+          if [ ! -f "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt" ]; then
+            echo "未获取到官方 craft-fonts，使用 DroidSansFallbackFull.ttf 构建 Hans 简体中文字体包..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fonts-droid-fallback
+            TTF_PATH=$(find /usr/share/fonts -name "DroidSansFallback*.ttf" | head -n 1)
+            if [ -z "$TTF_PATH" ]; then
+              echo "❌ 未找到中文字体文件"
+              exit 1
+            fi
+            mkdir -p "$GITHUB_WORKSPACE/craft-fonts/fonts"
+            cp "$TTF_PATH" "$GITHUB_WORKSPACE/craft-fonts/fonts/ChineseUI.ttf"
+            printf "Noto Sans SC | Regular | fonts/ChineseUI.ttf | Hans\n" > "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
+          fi
+          echo "=== 字体清单内容 ==="
+          cat "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
+
+          cat << 'PYEOF' > patch_zh_cn.py
+          import os, re
 
           # 1. 配置根 Cargo.toml 极致体积压缩 Profile
           cargo_file = "Cargo.toml"
@@ -91,58 +105,45 @@ jobs:
                   f.writelines(filtered)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 检查 crates/ 与 apps/ 下所有 build.rs，打印词库嵌入逻辑并刷新时间戳
-          for base in ["crates", "apps"]:
-              for root, _, files in os.walk(base):
-                  if "craft-i18n" in root:
-                      continue
-                  for fn in files:
-                      if fn == "build.rs":
-                          bp = os.path.join(root, fn)
-                          with open(bp, "r", encoding="utf-8") as f:
-                              bc = f.read()
-                          print(f"\n=== 检查构建脚本: {bp} ===")
-                          for idx, ln in enumerate(bc.splitlines(), 1):
-                              print(f"{idx}: {ln}")
-                          os.utime(bp, None)
+          # 2. 修改 crates/text/build.rs：允许 wasm32 保留 Hans 简体中文字体
+          text_build = "crates/text/build.rs"
+          if os.path.exists(text_build):
+              with open(text_build, "r", encoding="utf-8") as f:
+                  bc = f.read()
+              bc_new = re.sub(
+                  r'fn\s+wasm_keeps\s*\([^)]*\)\s*->\s*bool\s*\{[^}]*\}',
+                  'fn wasm_keeps(_family: &str, style: &str) -> bool {\n    style == "Regular"\n}',
+                  bc,
+                  flags=re.DOTALL
+              )
+              if bc_new != bc:
+                  with open(text_build, "w", encoding="utf-8") as f:
+                      f.write(bc_new)
+                  print("✅ 已放开 crates/text/build.rs 的 wasm32 简体中文字体嵌入限制")
 
-          # 3. 定位并打印 crates/ui-egui、crates/engine 与 apps/filmcraft-web 中的语言枚举与翻译实现
-          lang_files = []
-          for base in ["crates/ui-egui/src", "crates/engine/src", "apps/filmcraft-web/src"]:
-              if not os.path.exists(base):
-                  continue
+          # 3. 修改 crates/ui-egui/src/i18n.rs：将 #[default] 从 En 移至 ZhCn，并兼容 zh / zh-hans / zh-CN 解析
+          i18n_rs = "crates/ui-egui/src/i18n.rs"
+          if os.path.exists(i18n_rs):
+              with open(i18n_rs, "r", encoding="utf-8") as f:
+                  ic = f.read()
+              orig_ic = ic
+
+              ic = re.sub(r'#\[default\]\s*\n(\s*)En,', r'\1En,', ic)
+              ic = re.sub(r'(\s*)(ZhCn,)', r'\1#[default]\n\1\2', ic, count=1)
+              ic = ic.replace(
+                  '"zh-cn" => Some(Self::ZhCn),',
+                  '"zh-cn" | "zh" | "zh-hans" | "zh-Hans" | "zh-CN" => Some(Self::ZhCn),'
+              )
+
+              if ic != orig_ic:
+                  with open(i18n_rs, "w", encoding="utf-8") as f:
+                      f.write(ic)
+                  print("✅ 已将 crates/ui-egui/src/i18n.rs 默认语言枚举切换为 Language::ZhCn")
+
+          # 4. 修改 crates/engine/src/settings/prefs.rs 等默认语言字段为 zh-cn
+          for base in ["crates", "apps"]:
               for root, _, files in os.walk(base):
                   if "test" in root:
-                      continue
-                  for fn in files:
-                      if fn.endswith(".rs") and "test" not in fn:
-                          p = os.path.join(root, fn)
-                          with open(p, "r", encoding="utf-8") as f:
-                              txt = f.read()
-                          if "bcp47" in txt or "enum Language" in txt or "apps/filmcraft-web" in p.replace("\\", "/"):
-                              lang_files.append(p)
-                              print(f"\n=== 发现语言/Web入口文件: {p} ===")
-                              for idx, ln in enumerate(txt.splitlines()[:220], 1):
-                                  print(f"{idx}: {ln}")
-
-          # 4. 自动检测 Language 枚举中的简体中文变体并重写默认语言与回退逻辑
-          zh_variant = None
-          en_variants = ["En", "English", "EN"]
-          for p in lang_files:
-              with open(p, "r", encoding="utf-8") as f:
-                  txt = f.read()
-              m_enum = re.search(r'pub\s+enum\s+Language\s*\{([^}]+)\}', txt)
-              if m_enum:
-                  body = m_enum.group(1)
-                  for v in re.findall(r'\b([A-Za-z0-9_]+)\b', body):
-                      if v.lower() in ["zhhans", "zh_hans", "chinesesimplified", "simplifiedchinese", "zhcn", "zh_cn"]:
-                          zh_variant = v
-                          break
-                  print(f"✅ 识别到 Language 枚举中的简体中文变体: {zh_variant}")
-
-          for base in ["crates", "apps"]:
-              for root, _, files in os.walk(base):
-                  if any(x in root for x in ["test", "craft-i18n"]):
                       continue
                   for fn in files:
                       if fn.endswith(".rs") and "test" not in fn:
@@ -151,52 +152,23 @@ jobs:
                               c = f.read()
                           orig = c
 
-                          if zh_variant:
-                              for en_v in en_variants:
-                                  # 将 Default 实现中的英文默认改为简体中文变体
-                                  c = re.sub(
-                                      rf'(impl\s+Default\s+for\s+Language\s*\{{[^}}]*?)(?:Self|Language)::{en_v}\b',
-                                      rf'\1Language::{zh_variant}',
-                                      c,
-                                      flags=re.DOTALL
-                                  )
-                                  # 将解析失败回退 unwrap_or(Language::En / Self::En) 改为简体中文变体
-                                  c = re.sub(
-                                      rf'\.unwrap_or\(\s*(?:Self|Language)::{en_v}\s*\)',
-                                      f'.unwrap_or(Language::{zh_variant})',
-                                      c
-                                  )
-                                  # 将字段初始化 language: Language::En 改为简体中文变体
-                                  c = re.sub(
-                                      rf'(\blanguage\s*:\s*)(?:Self|Language)::{en_v}\b',
-                                      rf'\1Language::{zh_variant}',
-                                      c
-                                  )
-
                           c = re.sub(
                               r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
-                              r'\1vec!["zh-hans".to_owned()]',
+                              r'\1vec!["zh-cn".to_owned()]',
                               c,
                               flags=re.DOTALL
                           )
-                          c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
-                          c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
-                          c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
-                          c = re.sub(r'(locale\s*:\s*Option<String>\s*=\s*)None', r'\1Some("zh-hans".into())', c)
-                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh-hans";')
-                          c = c.replace('const DEFAULT_LANGUAGE: &str = "en";', 'const DEFAULT_LANGUAGE: &str = "zh-hans";')
-                          if "filmcraft-web" in path:
-                              c = c.replace('"en-US"', '"zh-Hans"').replace('"en"', '"zh-hans"')
+                          c = re.sub(r'(interface_language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-cn".into()', c)
+                          c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-cn".into()', c)
+                          c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-cn".into()', c)
 
                           if c != orig:
                               with open(path, "w", encoding="utf-8") as f:
                                   f.write(c)
-                              print(f"✅ 已修改语言配置: {path}")
+                              print(f"✅ 已锁定默认语言为 zh-cn: {path}")
 
-          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
+          # 5. 前端 index.html 注入：伪装浏览器语言为 zh-CN 并清理旧缓存
           for root, _, files in os.walk("apps"):
-              if "craft-i18n" in root:
-                  continue
               for file in files:
                   if file == "index.html":
                       target_html = os.path.join(root, file)
@@ -207,12 +179,12 @@ jobs:
                           "<script>\n"
                           "(function() {\n"
                           "  try {\n"
-                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-Hans'; } });\n"
-                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-Hans', 'zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_hans_v7') !== 'true') {\n"
+                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh-Hans', 'zh']; } });\n"
+                          "    if (localStorage.getItem('filmcraft_zh_cn_v1') !== 'true') {\n"
                           "      localStorage.clear();\n"
                           "      sessionStorage.clear();\n"
-                          "      localStorage.setItem('filmcraft_zh_hans_v7', 'true');\n"
+                          "      localStorage.setItem('filmcraft_zh_cn_v1', 'true');\n"
                           "      if (window.indexedDB && indexedDB.databases) {\n"
                           "        indexedDB.databases().then(function(dbs) {\n"
                           "          if (dbs && dbs.length > 0) {\n"
@@ -227,27 +199,27 @@ jobs:
                           "      }\n"
                           "    }\n"
                           "    ['filmcraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
-                          "      localStorage.setItem(k, 'zh-hans');\n"
+                          "      localStorage.setItem(k, 'zh-cn');\n"
                           "    });\n"
                           "  } catch(e) {}\n"
                           "})();\n"
                           "</script>\n"
                       )
-                      if "<head>" in html and "filmcraft_zh_hans_v7" not in html:
+                      if "<head>" in html and "filmcraft_zh_cn_v1" not in html:
                           html = html.replace("<head>", "<head>\n" + hook_script)
                           with open(target_html, "w", encoding="utf-8") as f:
                               f.write(html)
-                          print(f"✅ 已在 {target_html} 注入 zh-Hans 重定向与同步清库脚本")
+                          print(f"✅ 已在 {target_html} 注入 zh-CN 重定向与清库脚本")
           PYEOF
 
-          python3 patch_zh_hans.py
-          rm -f patch_zh_hans.py
+          python3 patch_zh_cn.py
+          rm -f patch_zh_cn.py
 
-      # 6. 清理旧编译指纹并编译 filmcraft-web Wasm
+      # 6. 清理旧编译指纹并携带 CRAFT_FONTS_DIR 编译 filmcraft-web Wasm
       - name: Build FilmCraft WebAssembly Application
         env:
           CARGO_BUILD_JOBS: 2
-          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
         run: |
           mkdir -p dist/web
 
