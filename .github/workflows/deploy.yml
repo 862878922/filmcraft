@@ -65,7 +65,7 @@ jobs:
           cat << 'PYEOF' > patch_zh_hans.py
           import os, re, shutil, tomllib
 
-          # 1. 自动展开 vendor_craft_libs 中所有子 crate 的 .workspace = true 继承，消除 Cargo 解析报错
+          # 1. 自动展开 vendor_craft_libs 中所有子 crate 的 .workspace = true 继承
           ws_toml_path = "vendor_craft_libs/Cargo.toml"
           if os.path.exists(ws_toml_path):
               with open(ws_toml_path, "rb") as f:
@@ -206,26 +206,29 @@ jobs:
                               c = f.read()
                           orig = c
 
-                          # 打印 craft-i18n 关键源码便于验证
-                          if "crates/i18n/src/" in path.replace("\\", "/"):
-                              print(f"\n--- {path} 关键片段 ---")
-                              for idx, ln in enumerate(c.splitlines()[:60], 1):
-                                  print(f"{idx}: {ln}")
-
+                          # 针对 craft-i18n 内部的 self.match_tag(...).unwrap_or(Lang::EN) 直接使用 self.match_tag("zh-hans")
                           c = re.sub(
-                              r'\.unwrap_or\(\s*Lang::EN\s*\)',
-                              '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
+                              r'(self\.match_tag\([^)]+\))\.unwrap_or\(\s*Lang::EN\s*\)',
+                              r'\1.unwrap_or_else(|| self.match_tag("zh-hans").unwrap_or(Lang::EN))',
                               c
                           )
+                          # 若当前文件作用域内定义了 lang_from_tag，则将剩余的 unwrap_or(Lang::EN) 重定向至 lang_from_tag("zh-hans")
+                          if "lang_from_tag" in c:
+                              c = re.sub(
+                                  r'\.unwrap_or\(\s*Lang::EN\s*\)',
+                                  '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
+                                  c
+                              )
+                              c = re.sub(
+                                  r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
+                                  r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
+                                  c,
+                                  flags=re.DOTALL
+                              )
+
                           c = re.sub(
                               r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
                               r'\1vec!["zh-hans".to_owned()]',
-                              c,
-                              flags=re.DOTALL
-                          )
-                          c = re.sub(
-                              r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
-                              r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
                               c,
                               flags=re.DOTALL
                           )
