@@ -39,13 +39,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      # 4. 安装兼容版 Trunk
-      - name: Install Trunk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: trunk@0.20.3
-
-      # 5. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 包装器
+      # 4. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 包装器
       - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
@@ -56,14 +50,9 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 6. 配置官方 zh-hans 简体中文词库并锁定默认语言为 zh-hans
+      # 5. 配置官方 zh-hans 简体中文词库并锁定默认语言为 zh-hans
       - name: Configure Official zh-hans Locale and Patch Lang Resolution
         run: |
-          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
-          find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
-          find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
-
-          # 克隆官方多语言词库（完整保留 locales/zh-hans/filmcraft.tsv 与 common.tsv）
           rm -rf "$GITHUB_WORKSPACE/craft-i18n"
           git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n"
 
@@ -110,48 +99,7 @@ jobs:
                   if not os.path.exists(alias_dir):
                       shutil.copytree(zh_hans_dir, alias_dir)
 
-          # 3. 修改 crates/ui-egui/src/i18n/system.rs（wasm32 探测与 Lang::EN 默认回退）
-          sys_rs = "crates/ui-egui/src/i18n/system.rs"
-          if os.path.exists(sys_rs):
-              with open(sys_rs, "r", encoding="utf-8") as f:
-                  s = f.read()
-              orig_s = s
-
-              s = re.sub(
-                  r'\.unwrap_or\(\s*Lang::EN\s*\)',
-                  '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
-                  s
-              )
-              s = re.sub(
-                  r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
-                  r'\1vec!["zh-hans".to_owned()]',
-                  s,
-                  flags=re.DOTALL
-              )
-
-              if s != orig_s:
-                  with open(sys_rs, "w", encoding="utf-8") as f:
-                      f.write(s)
-                  print("✅ 已修改 crates/ui-egui/src/i18n/system.rs：wasm32 默认解析为 zh-hans")
-
-          # 4. 修改 i18n 模块入口（兼容 i18n.rs 与 i18n/mod.rs）中的默认 Lang 实现
-          for i18n_rs in ["crates/ui-egui/src/i18n.rs", "crates/ui-egui/src/i18n/mod.rs"]:
-              if os.path.exists(i18n_rs):
-                  with open(i18n_rs, "r", encoding="utf-8") as f:
-                      code = f.read()
-
-                  new_code = re.sub(
-                      r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
-                      r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
-                      code,
-                      flags=re.DOTALL
-                  )
-                  if new_code != code:
-                      with open(i18n_rs, "w", encoding="utf-8") as f:
-                          f.write(new_code)
-                      print(f"✅ 已修改 {i18n_rs}：Lang::default() 指向 zh-hans")
-
-          # 5. 扫描 crates/ui-egui 下非测试源码，锁定默认语言首选项为 zh-hans
+          # 3. 全面重定向 crates/ui-egui 下的默认语言与 wasm32 系统探测至 zh-hans
           for root, _, files in os.walk("crates/ui-egui/src"):
               for file in files:
                   if file.endswith(".rs") and "test" not in file and "test" not in root:
@@ -160,6 +108,25 @@ jobs:
                           c = f.read()
                       orig = c
 
+                      # 替换 Lang::EN 默认回退与 wasm32 空探测
+                      c = re.sub(
+                          r'\.unwrap_or\(\s*Lang::EN\s*\)',
+                          '.unwrap_or_else(|| lang_from_tag("zh-hans").unwrap_or(Lang::EN))',
+                          c
+                      )
+                      c = re.sub(
+                          r'(target_arch\s*=\s*"wasm32"[^{]*\{\s*)Vec::new\(\)',
+                          r'\1vec!["zh-hans".to_owned()]',
+                          c,
+                          flags=re.DOTALL
+                      )
+                      c = re.sub(
+                          r'(impl\s+Default\s+for\s+Lang\s*\{[^}]*?)Lang::EN',
+                          r'\1lang_from_tag("zh-hans").unwrap_or(Lang::EN)',
+                          c,
+                          flags=re.DOTALL
+                      )
+                      # 替换首选项默认语言字段
                       c = re.sub(r'(language\s*:\s*String\s*=\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
                       c = re.sub(r'(language\s*:\s*)"(system|en|auto)"\.into\(\)', r'\1"zh-hans".into()', c)
                       c = re.sub(r'(ui_language\s*:\s*)None', r'\1Some("zh-hans".into())', c)
@@ -170,9 +137,9 @@ jobs:
                       if c != orig:
                           with open(path, "w", encoding="utf-8") as f:
                               f.write(c)
-                          print(f"✅ 已修改首选项默认语言为 zh-hans: {path}")
+                          print(f"✅ 已锁定 zh-hans 默认语言: {path}")
 
-          # 6. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
+          # 4. 前端 index.html 注入：伪装浏览器语言为 zh-Hans 并清理旧缓存
           for root, _, files in os.walk("apps"):
               for file in files:
                   if file == "index.html":
@@ -213,68 +180,87 @@ jobs:
           python3 patch_zh_hans.py
           rm -f patch_zh_hans.py
 
-      # 7. 进入 apps/filmcraft-web 目录执行 Trunk 构建，确保正确关联 Cargo.toml
-      - name: Build Web Application
+      # 6. 编译 filmcraft-web Wasm 并匹配 Cargo.lock 版本的 wasm-bindgen 打包到 dist/web
+      - name: Build FilmCraft WebAssembly Application
         env:
           CARGO_BUILD_JOBS: 2
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-          echo "=== 检查 apps/filmcraft-web/web 目录内容 ==="
-          ls -la apps/filmcraft-web/web/
 
-          if [ -f "apps/filmcraft-web/Trunk.toml" ]; then
-            (cd apps/filmcraft-web && trunk build --release)
-          elif [ -f "apps/filmcraft-web/index.html" ]; then
-            (cd apps/filmcraft-web && trunk build index.html --release)
-          elif [ -f "apps/filmcraft-web/web/index.html" ]; then
-            python3 -c '
-          p = "apps/filmcraft-web/web/index.html"
-          with open(p, "r", encoding="utf-8") as f:
-              h = f.read()
-          if "rel=\"rust\"" in h and "href=" not in h:
-              h = h.replace("rel=\"rust\"", "rel=\"rust\" href=\"../Cargo.toml\"")
-              with open(p, "w", encoding="utf-8") as f:
-                  f.write(h)
-              print("✅ 已为 web/index.html 添加 href=\"../Cargo.toml\"")
-          '
-            (cd apps/filmcraft-web && trunk build web/index.html --release)
-          else
-            TARGET_HTML=$(find apps -name "index.html" | head -n 1)
-            trunk build "$TARGET_HTML" --release
+          # 提取 Cargo.lock 中锁定的 wasm-bindgen 精确版本
+          WBG_VER=$(python3 -c '
+          import re
+          with open("Cargo.lock", "r", encoding="utf-8") as f:
+              txt = f.read()
+          m = re.search(r"\[\[package\]\]\s*name = \"wasm-bindgen\"\s*version = \"([^\"]+)\"", txt)
+          print(m.group(1) if m else "")
+          ')
+          echo "检测到 Cargo.lock 锁定的 wasm-bindgen 版本: $WBG_VER"
+
+          # 安装对应版本的 wasm-bindgen-cli
+          if [ -n "$WBG_VER" ]; then
+            curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
+              || curl -fsSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
+              || true
+            if [ -f wbg.tar.gz ]; then
+              tar -xzf wbg.tar.gz
+              sudo cp wasm-bindgen-*/wasm-bindgen /usr/local/bin/
+              rm -rf wbg.tar.gz wasm-bindgen-*
+            else
+              cargo install wasm-bindgen-cli --version "$WBG_VER" --locked
+            fi
+          fi
+          wasm-bindgen --version
+
+          # 编译 filmcraft-web 的 wasm32 release 产物
+          cargo build -p filmcraft-web --target wasm32-unknown-unknown --release
+
+          WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -n 1)
+          echo "定位到编译生成的 Wasm: $WASM_FILE"
+          if [ -z "$WASM_FILE" ]; then
+            echo "❌ 未找到编译生成的 .wasm 文件"
+            exit 1
           fi
 
+          # 复制静态前端资源（index.html, audio-worklet.js, favicon.png 等）到 dist/web/
+          cp -r apps/filmcraft-web/web/* dist/web/
+
+          # 自动识别 index.html 中引用的 JS 模块名并生成对应胶水代码
+          OUT_NAME=$(python3 -c '
+          import re, os
+          html_path = "dist/web/index.html"
+          with open(html_path, "r", encoding="utf-8") as f:
+              html = f.read()
+          m = re.search(r"from\s+[\"\x27]\./([^\"\x27]+)\.js[\"\x27]", html)
+          if m:
+              print(m.group(1))
+          else:
+              print("filmcraft_web")
+          ')
+          echo "目标 JS/Wasm 输出前缀: $OUT_NAME"
+
+          wasm-bindgen --target web --out-dir dist/web --out-name "$OUT_NAME" "$WASM_FILE"
+
+          # 若 index.html 尚未包含模块启动脚本，自动追加初始化脚本
           python3 -c '
-          import os, shutil, glob
-
-          all_wasm = [
-              p for p in glob.glob("apps/**/*.wasm", recursive=True)
-              if "target" not in p and "dist/web" not in p
-          ]
-          if not all_wasm:
-              all_wasm = [
-                  p for p in glob.glob("**/*.wasm", recursive=True)
-                  if "target" not in p and "dist/web" not in p and "fixtures" not in p
-              ]
-          print("发现编译产物路径:", all_wasm)
-
-          if all_wasm:
-              source_dir = os.path.dirname(all_wasm[0])
-              print(f"定位到实际产物目录: {source_dir}，正在归拢到 dist/web/ ...")
-              for item in os.listdir(source_dir):
-                  src = os.path.join(source_dir, item)
-                  dst = os.path.join("dist/web", item)
-                  if os.path.isdir(src):
-                      shutil.copytree(src, dst, dirs_exist_ok=True)
-                  else:
-                      shutil.copy2(src, dst)
-              print("✅ 产物已成功归拢到 dist/web/")
-          '
+          import os
+          out_name = os.environ.get("OUT_NAME", "filmcraft_web")
+          html_path = "dist/web/index.html"
+          with open(html_path, "r", encoding="utf-8") as f:
+              html = f.read()
+          if f"{out_name}.js" not in html:
+              boot = f"\n<script type=\"module\">\nimport init from \"./{out_name}.js\";\ninit();\n</script>\n"
+              html = html.replace("</body>", boot + "</body>") if "</body>" in html else html + boot
+              with open(html_path, "w", encoding="utf-8") as f:
+                  f.write(html)
+              print(f"✅ 已在 index.html 注入 {out_name}.js 启动脚本")
+          ' OUT_NAME="$OUT_NAME"
 
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 25MB 限制）
+      # 7. 深度压缩 wasm 并执行强制切片（保证单文件小于 20MB，规避 Cloudflare 25MB 限制）
       - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
           echo "=== 开始对所有 wasm 进行极致压缩与切片检测 ==="
@@ -389,7 +375,7 @@ jobs:
           echo "=== 最终提交部署的文件列表（确认无任何文件大于 20MB） ==="
           ls -lh dist/web/
 
-      # 9. 部署发布到 Cloudflare Pages (lotelf-pr)
+      # 8. 部署发布到 Cloudflare Pages (lotelf-pr)
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
