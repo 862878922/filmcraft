@@ -213,38 +213,38 @@ jobs:
           python3 patch_zh_hans.py
           rm -f patch_zh_hans.py
 
-      # 7. 进入 apps/filmcraft-web 目录执行 Trunk 构建，确保正确关联 Cargo.toml 与 Trunk.toml
+      # 7. 进入 apps/filmcraft-web 目录执行 Trunk 构建，确保正确关联 Cargo.toml
       - name: Build Web Application
         env:
           CARGO_BUILD_JOBS: 2
           CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-          echo "=== 检查 apps/filmcraft-web 目录结构 ==="
-          ls -la apps/filmcraft-web/
+          echo "=== 检查 apps/filmcraft-web/web 目录内容 ==="
+          ls -la apps/filmcraft-web/web/
 
           if [ -f "apps/filmcraft-web/Trunk.toml" ]; then
-            echo "使用 apps/filmcraft-web/Trunk.toml 进行构建..."
             (cd apps/filmcraft-web && trunk build --release)
           elif [ -f "apps/filmcraft-web/index.html" ]; then
             (cd apps/filmcraft-web && trunk build index.html --release)
           elif [ -f "apps/filmcraft-web/web/index.html" ]; then
-            python3 - << 'EOF'
-            p = "apps/filmcraft-web/web/index.html"
-            with open(p, "r", encoding="utf-8") as f:
-                h = f.read()
-            if 'rel="rust"' in h and 'href=' not in h:
-                h = h.replace('rel="rust"', 'rel="rust" href="../Cargo.toml"')
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(h)
-            EOF
+            python3 -c '
+          p = "apps/filmcraft-web/web/index.html"
+          with open(p, "r", encoding="utf-8") as f:
+              h = f.read()
+          if "rel=\"rust\"" in h and "href=" not in h:
+              h = h.replace("rel=\"rust\"", "rel=\"rust\" href=\"../Cargo.toml\"")
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(h)
+              print("✅ 已为 web/index.html 添加 href=\"../Cargo.toml\"")
+          '
             (cd apps/filmcraft-web && trunk build web/index.html --release)
           else
             TARGET_HTML=$(find apps -name "index.html" | head -n 1)
             trunk build "$TARGET_HTML" --release
           fi
-          
-          python3 - << 'EOF'
+
+          python3 -c '
           import os, shutil, glob
 
           all_wasm = [
@@ -257,7 +257,7 @@ jobs:
                   if "target" not in p and "dist/web" not in p and "fixtures" not in p
               ]
           print("发现编译产物路径:", all_wasm)
-          
+
           if all_wasm:
               source_dir = os.path.dirname(all_wasm[0])
               print(f"定位到实际产物目录: {source_dir}，正在归拢到 dist/web/ ...")
@@ -269,7 +269,7 @@ jobs:
                   else:
                       shutil.copy2(src, dst)
               print("✅ 产物已成功归拢到 dist/web/")
-          EOF
+          '
 
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
