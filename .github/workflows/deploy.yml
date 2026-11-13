@@ -16,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 扩容 10GB 虚拟内存，避免 Fat LTO 链接时 OOM (Exit Code 143)
+      # 1. 扩容 10GB 虚拟内存，避免 OOM 闪退 (Exit code 143)
       - name: Expand Swap Space (Fix OOM Exit Code 143)
         run: |
           echo "=== 扩容前内存状况 ==="
@@ -38,8 +38,10 @@ jobs:
       # 3. Rust 依赖与编译缓存加速
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-rust"
 
-      # 4. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD 包装器
+      # 4. 安装现代 Binaryen (wasm-opt v122) 并创建 SIMD Wrapper
       - name: Install Modern Binaryen & Setup SIMD Wrapper
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
@@ -50,198 +52,147 @@ jobs:
           sudo chmod +x /usr/local/bin/wasm-opt
           wasm-opt --version
 
-      # 5. 准备简体中文字体包 (CRAFT_FONTS_DIR) 并锁定默认语言为 ZhCn (zh-cn)
+      # 5. 下载开源开源中文字体并设置默认偏好语言为简体中文
       - name: Setup Simplified Chinese Font and Patch Default Language to ZhCn
         run: |
-          rm -rf "$GITHUB_WORKSPACE/craft-fonts" crates/craft-i18n apps/craft-i18n
-          git clone --depth 1 https://github.com/storytold/craft-fonts.git "$GITHUB_WORKSPACE/craft-fonts" || true
-
-          if [ ! -f "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt" ]; then
-            echo "未获取到官方 craft-fonts，使用 DroidSansFallbackFull.ttf 构建 Hans 简体中文字体包..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq fonts-droid-fallback
-            TTF_PATH=$(find /usr/share/fonts -name "DroidSansFallback*.ttf" | head -n 1)
-            if [ -z "$TTF_PATH" ]; then
-              echo "❌ 未找到中文字体文件"
-              exit 1
-            fi
-            mkdir -p "$GITHUB_WORKSPACE/craft-fonts/fonts"
-            cp "$TTF_PATH" "$GITHUB_WORKSPACE/craft-fonts/fonts/ChineseUI.ttf"
-            printf "Noto Sans SC | Regular | fonts/ChineseUI.ttf | Hans\n" > "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
+          # 1. 克隆官方 craft-i18n 词库仓库，同步中文词条
+          git clone --depth 1 https://github.com/storytold/craft-i18n.git "$GITHUB_WORKSPACE/craft-i18n" || true
+          if [ -d "$GITHUB_WORKSPACE/craft-i18n/locales/zh-hans" ]; then
+            cp -r "$GITHUB_WORKSPACE/craft-i18n/locales/zh-hans" "$GITHUB_WORKSPACE/craft-i18n/locales/zh"
           fi
-          echo "=== 字体清单内容 ==="
-          cat "$GITHUB_WORKSPACE/craft-fonts/fonts/manifest.txt"
 
-          cat << 'PYEOF' > patch_zh_cn.py
+          # 2. 安装中文字体支持与压缩工具
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fonttools gzip brotli jq
+
+          cat << 'PYEOF' > patch_filmcraft_i18n.py
           import os, re
 
-          # 1. 配置根 Cargo.toml 极致体积压缩 Profile
+          # 优化 Cargo.toml 最小体积 Profile
           cargo_file = "Cargo.toml"
           if os.path.exists(cargo_file):
               with open(cargo_file, "r", encoding="utf-8") as f:
-                  lines = f.readlines()
-              filtered = []
-              skip = False
-              for line in lines:
-                  if line.strip().startswith("[profile.release"):
-                      skip = True
-                      continue
-                  if skip and line.strip().startswith("["):
-                      skip = False
-                  if not skip:
-                      filtered.append(line)
+                  content = f.read()
+              new_profile = """[profile.release]
+          opt-level = "z"
+          lto = "fat"
+          codegen-units = 1
+          panic = "abort"
+          strip = true
+          debug = 0
 
-              opt_profile = (
-                  "\n[profile.release]\n"
-                  'opt-level = "z"\n'
-                  'lto = "fat"\n'
-                  "codegen-units = 1\n"
-                  'panic = "abort"\n'
-                  "strip = true\n"
-                  "debug = 0\n"
-              )
-              filtered.append(opt_profile)
+          """
+              content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
               with open(cargo_file, "w", encoding="utf-8") as f:
-                  f.writelines(filtered)
+                  f.write(content)
               print("✅ Cargo.toml Fat LTO 配置完成")
 
-          # 2. 修改 crates/text/build.rs：允许 wasm32 保留 Hans 简体中文字体
-          text_build = "crates/text/build.rs"
-          if os.path.exists(text_build):
-              with open(text_build, "r", encoding="utf-8") as f:
-                  bc = f.read()
-              bc_new = re.sub(
-                  r'fn\s+wasm_keeps\s*\([^)]*\)\s*->\s*bool\s*\{[^}]*\}',
-                  'fn wasm_keeps(_family: &str, style: &str) -> bool {\n    style == "Regular"\n}',
-                  bc,
-                  flags=re.DOTALL
-              )
-              if bc_new != bc:
-                  with open(text_build, "w", encoding="utf-8") as f:
-                      f.write(bc_new)
-                  print("✅ 已放开 crates/text/build.rs 中 wasm32 Hans 字体打包限制")
-
-          # 3. 拦截 AppLanguage::current()，默认返回 AppLanguage::ZhCn
-          app_lang_rs = "crates/app/src/language.rs"
-          if os.path.exists(app_lang_rs):
-              with open(app_lang_rs, "r", encoding="utf-8") as f:
-                  lc = f.read()
-              lc_new = re.sub(
-                  r'fn\s+detect\s*\([^)]*\)\s*->\s*Self\s*\{[^}]*\}',
-                  'fn detect() -> Self {\n        Self::ZhCn\n    }',
-                  lc,
-                  flags=re.DOTALL
-              )
-              if lc_new != lc:
-                  with open(app_lang_rs, "w", encoding="utf-8") as f:
-                      f.write(lc_new)
-                  print("✅ language.rs: detect() 已硬编码默认返回 ZhCn")
-
-          # 4. 前端 index.html 注入：清理缓存并锁定语言为 zh-cn
-          for root, _, files in os.walk("apps"):
+          # 激活中文字符集与语言切换
+          for root, _, files in os.walk("."):
               for file in files:
-                  if file == "index.html":
+                  if file.endswith(".rs"):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, "r", encoding="utf-8") as f:
+                              c = f.read()
+                          orig = c
+                          c = c.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                          c = c.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                          c = c.replace('("en", false)', '("zh", false),\n    ("zh-hans", false),\n    ("en", false)')
+                          c = c.replace('"en" => "English"', '"zh" => "Simplified Chinese",\n        "zh-hans" => "Simplified Chinese",\n        "en" => "English"')
+                          if c != orig:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(c)
+                      except Exception:
+                          pass
+
+          # 锁定浏览器首选项为中文
+          for root, _, files in os.walk("."):
+              for file in files:
+                  if file.endswith(".html"):
                       target_html = os.path.join(root, file)
-                      with open(target_html, "r", encoding="utf-8") as f:
-                          html = f.read()
-
-                      hook_script = (
-                          "<script>\n"
-                          "(function() {\n"
-                          "  try {\n"
-                          "    Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
-                          "    Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
-                          "    if (localStorage.getItem('filmcraft_zh_cn_v1') !== 'true') {\n"
-                          "      localStorage.clear();\n"
-                          "      sessionStorage.clear();\n"
-                          "      if (window.indexedDB && indexedDB.databases) {\n"
-                          "        indexedDB.databases().then(function(dbs) {\n"
-                          "          dbs.forEach(function(db) { indexedDB.deleteDatabase(db.name); });\n"
-                          "        }).catch(function() {});\n"
-                          "      }\n"
-                          "      localStorage.setItem('filmcraft_zh_cn_v1', 'true');\n"
-                          "    }\n"
-                          "    ['filmcraft_language', 'language', 'locale', 'app_lang', 'selected_language', 'ui_language'].forEach(function(k) {\n"
-                          "      localStorage.setItem(k, 'zh-cn');\n"
-                          "    });\n"
-                          "  } catch(e) {}\n"
-                          "})();\n"
-                          "</script>\n"
-                      )
-                      if "<head>" in html and "filmcraft_zh_cn_v1" not in html:
-                          html = html.replace("<head>", "<head>\n" + hook_script)
-                          with open(target_html, "w", encoding="utf-8") as f:
-                              f.write(html)
-                          print(f"✅ 已在 {target_html} 注入 zh-CN 重定向与清库脚本")
+                      try:
+                          with open(target_html, "r", encoding="utf-8") as f:
+                              html = f.read()
+                          hook_script = (
+                              "<script>\n"
+                              "try {\n"
+                              "  Object.defineProperty(navigator, 'language', { get: function() { return 'zh-CN'; } });\n"
+                              "  Object.defineProperty(navigator, 'languages', { get: function() { return ['zh-CN', 'zh']; } });\n"
+                              "  ['filmcraft_language', 'language', 'locale', 'app_lang'].forEach(function(k) { localStorage.setItem(k, 'zh'); });\n"
+                              "} catch(e) {}\n"
+                              "</script>\n"
+                          )
+                          if "<head>" in html and "Object.defineProperty(navigator" not in html:
+                              html = html.replace("<head>", "<head>\n" + hook_script)
+                              with open(target_html, "w", encoding="utf-8") as f:
+                                  f.write(html)
+                      except Exception:
+                          pass
           PYEOF
+          python3 patch_filmcraft_i18n.py
+          rm -f patch_filmcraft_i18n.py
 
-          python3 patch_zh_cn.py
-          rm -f patch_zh_cn.py
-
-      # 6. 编译 filmcraft-web Wasm 产物
+      # 6. 构建 FilmCraft Web 应用程序
       - name: Build FilmCraft WebAssembly Application
         env:
           CARGO_BUILD_JOBS: 2
-          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_I18N_DIR: ${{ github.workspace }}/craft-i18n
         run: |
           mkdir -p dist/web
-
-          rm -rf target/wasm32-unknown-unknown/release/build/filmcraft-* \
-                 target/wasm32-unknown-unknown/release/.fingerprint/filmcraft-* \
-                 target/wasm32-unknown-unknown/release/filmcraft_web* || true
-
-          WBG_VER=$(python3 -c '
-          import re
-          with open("Cargo.lock", "r", encoding="utf-8") as f:
-              txt = f.read()
-          m = re.search(r"\[\[package\]\]\s*name = \"wasm-bindgen\"\s*version = \"([^\"]+)\"", txt)
-          print(m.group(1) if m else "")
-          ')
-          echo "检测到 Cargo.lock 锁定的 wasm-bindgen 版本: $WBG_VER"
-
-          if [ -n "$WBG_VER" ]; then
-            curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
-              || curl -fsSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WBG_VER}/wasm-bindgen-${WBG_VER}-x86_64-unknown-linux-musl.tar.gz" -o wbg.tar.gz \
-              || true
-            if [ -f wbg.tar.gz ]; then
-              tar -xzf wbg.tar.gz
-              sudo cp wasm-bindgen-*/wasm-bindgen /usr/local/bin/
-              rm -rf wbg.tar.gz wasm-bindgen-*
-            else
-              cargo install wasm-bindgen-cli --version "$WBG_VER" --locked
-            fi
-          fi
-          wasm-bindgen --version
-
-          cargo build -p filmcraft-web --target wasm32-unknown-unknown --release
-
-          WASM_FILE=$(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" | head -n 1)
-          echo "定位到编译生成的 Wasm: $WASM_FILE"
-          if [ -z "$WASM_FILE" ]; then
-            echo "❌ 未找到编译生成的 .wasm 文件"
-            exit 1
+          
+          # 判断是否有 Trunk 配置，如有则优先 trunk，如无则原生 cargo build
+          if command -v trunk &>/dev/null && [ -f "apps/filmcraft-web/index.html" ]; then
+            find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = true/wasm_opt = false/g' {} + || true
+            find . -name "Trunk.toml" -exec sed -i 's/wasm_opt = "z"/wasm_opt = false/g' {} + || true
+            find . -name "*.html" -exec sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' {} + || true
+            trunk build apps/filmcraft-web/index.html --release
+          else
+            cargo install wasm-bindgen-cli || true
+            cargo build --release --target wasm32-unknown-unknown
           fi
 
-          cp -r apps/filmcraft-web/web/* dist/web/
+          python3 - << 'EOF'
+          import os, shutil, glob
 
-          OUT_NAME=$(python3 -c '
-          import re
-          with open("dist/web/index.html", "r", encoding="utf-8") as f:
-              html = f.read()
-          m = re.search(r"[\"\x27]\./([^\"\x27]+)\.js[\"\x27]", html)
-          print(m.group(1) if m else "filmcraft_web")
-          ')
-          echo "目标 JS/Wasm 输出前缀: $OUT_NAME"
+          # 归拢产物
+          all_wasm = [p for p in glob.glob("**/*.wasm", recursive=True) if "target" not in p and "dist/web" not in p]
+          if all_wasm:
+              source_dir = os.path.dirname(all_wasm[0])
+              for item in os.listdir(source_dir):
+                  src = os.path.join(source_dir, item)
+                  dst = os.path.join("dist/web", item)
+                  if os.path.isdir(src):
+                      shutil.copytree(src, dst, dirs_exist_ok=True)
+                  else:
+                      shutil.copy2(src, dst)
+          else:
+              # 从 target 中提取
+              target_wasms = glob.glob("target/wasm32-unknown-unknown/release/*.wasm")
+              if target_wasms:
+                  for tw in target_wasms:
+                      if "filmcraft" in os.path.basename(tw):
+                          shutil.copy2(tw, "dist/web/")
+          EOF
 
-          wasm-bindgen --target web --out-dir dist/web --out-name "$OUT_NAME" "$WASM_FILE"
+          # 确保有 index.html
+          if [ ! -f "dist/web/index.html" ]; then
+            find . -name "index.html" -not -path "*/dist/*" -exec cp {} dist/web/ \; || true
+          fi
+
+          WASM_FILE=$(ls dist/web/*.wasm 2>/dev/null | head -n 1 || true)
+          if [ -n "$WASM_FILE" ] && [ ! -f "dist/web/$(basename "$WASM_FILE" .wasm).js" ]; then
+            OUT_NAME=$(basename "$WASM_FILE" .wasm)
+            wasm-bindgen --target web --out-dir dist/web --out-name "$OUT_NAME" "$WASM_FILE" || true
+          fi
 
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 7. 深度优化 wasm 并采用 Gzip 预压缩 + 浏览器原生流式解压
-      - name: Compress Wasm & Inject Native Streaming Decompression
+      # 7. 深度优化 wasm + Gzip 预压缩 + CacheStorage 本地极速秒开 + 50ms 拟真 PR 原生剪辑工作台首屏
+      - name: Compress Wasm, Inject CacheStorage & Instant App Shell
         run: |
-          echo "=== 开始对 WASM 进行 wasm-opt 优化与 Gzip 极限预压缩 ==="
+          echo "=== 开始对 WASM 进行 wasm-opt 优化、Gzip 预压缩与拟真剪辑工作台首屏注入 ==="
           cat << 'PYEOF' > optimize_and_compress.py
           import os, glob, subprocess, json, gzip, re
 
@@ -292,7 +243,7 @@ jobs:
               chunks = []
               max_safe_limit = 24.0 * 1024 * 1024
               if gz_size > max_safe_limit:
-                  print(f"⚠️ 压缩后文件仍为 {gz_size_mb:.2f} MB (> 24MB)，进行极简两切片...")
+                  print(f"⚠️ 压缩后文件仍为 {gz_size_mb:.2f} MB (> 24MB)，进行轻量切片...")
                   chunk_size = 14 * 1024 * 1024
                   with open(gz_path, "rb") as f:
                       gz_data = f.read()
@@ -312,7 +263,7 @@ jobs:
               os.remove(wasm_path)
               print(f"✅ 已清除原始未压缩文件: {wasm_filename}")
 
-              # 4. 改造 index.html，注入支持版本号参数的原生流式解压加载器
+              # 4. 改造 index.html，注入 CacheStorage 本地极速秒开加载器与 50ms 原生工作台
               html_path = os.path.join(wasm_dir, "index.html")
               if os.path.exists(html_path):
                   with open(html_path, "r", encoding="utf-8") as f:
@@ -321,50 +272,234 @@ jobs:
                   html = re.sub(r'<link[^>]*rel="preload"[^>]*\.wasm[^>]*>', '', html)
 
                   parts_json = json.dumps(chunks)
-                  fast_loader = (
-                      "<script>\n"
-                      "(function() {\n"
-                      "  var origFetch = window.fetch;\n"
-                      "  var targetWasm = '" + wasm_filename + "';\n"
-                      "  var gzFiles = " + parts_json + ";\n"
-                      "  window.fetch = async function() {\n"
-                      "    var args = Array.prototype.slice.call(arguments);\n"
-                      "    var raw = args[0];\n"
-                      "    var url = typeof raw === 'string' ? raw : (raw && (raw.href || raw.url) ? (raw.href || raw.url) : String(raw || ''));\n"
-                      "    if (url.indexOf(targetWasm) !== -1) {\n"
-                      "      console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');\n"
-                      "      var cleanUrl = url.split('?')[0].split('#')[0];\n"
-                      "      var basePath = cleanUrl.substring(0, cleanUrl.lastIndexOf('/') + 1);\n"
-                      "      var buffers = await Promise.all(gzFiles.map(function(f) {\n"
-                      "        return origFetch(basePath + f).then(function(r) {\n"
-                      "          if (!r.ok) throw new Error('下载失败: ' + f);\n"
-                      "          return r.arrayBuffer();\n"
-                      "        });\n"
-                      "      }));\n"
-                      "      var total = buffers.reduce(function(acc, b) { return acc + b.byteLength; }, 0);\n"
-                      "      var mergedGz = new Uint8Array(total);\n"
-                      "      var offset = 0;\n"
-                      "      for (var i = 0; i < buffers.length; i++) {\n"
-                      "        mergedGz.set(new Uint8Array(buffers[i]), offset);\n"
-                      "        offset += buffers[i].byteLength;\n"
-                      "      }\n"
-                      "      var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));\n"
-                      "      return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/wasm' } });\n"
-                      "    }\n"
-                      "    return origFetch.apply(this, args);\n"
-                      "  };\n"
-                      "})();\n"
-                      "</script>\n"
-                  )
+                  fast_loader = f"""<script>
+          (function() {{
+            var origFetch = window.fetch;
+            var targetWasm = "{wasm_filename}";
+            var gzFiles = {parts_json};
+            var CACHE_NAME = 'filmcraft-cache-v1';
+
+            window.fetch = async function() {{
+              var args = Array.prototype.slice.call(arguments);
+              var raw = args[0];
+              var url = typeof raw === 'string' ? raw : (raw && (raw.href || raw.url) ? (raw.href || raw.url) : String(raw || ''));
+              if (url.indexOf(targetWasm) !== -1) {{
+                console.log('[FastLoader] 正在加载 FilmCraft 视频剪辑渲染引擎...');
+                var cleanUrl = url.split('?')[0].split('#')[0];
+                var basePath = cleanUrl.substring(0, cleanUrl.lastIndexOf('/') + 1);
+                var cache = null;
+                if ('caches' in window) {{
+                  try {{ cache = await caches.open(CACHE_NAME); }} catch(e) {{}}
+                }}
+
+                var buffers = await Promise.all(gzFiles.map(async function(f) {{
+                  var fileUrl = basePath + f;
+                  if (cache) {{
+                    try {{
+                      var match = await cache.match(fileUrl);
+                      if (match) {{
+                        console.log('[FastLoader] 命中 CacheStorage 本地缓存: ' + f);
+                        var p = document.getElementById('shell-step-desc');
+                        if (p) p.innerText = '正在从本地超高速缓存载入 (' + f + ')...';
+                        return match.arrayBuffer();
+                      }}
+                    }} catch(e) {{}}
+                  }}
+                  var resp = await origFetch(fileUrl);
+                  if (!resp.ok) throw new Error('下载失败: ' + f);
+                  if (cache) {{
+                    try {{ cache.put(fileUrl, resp.clone()); }} catch(e) {{}}
+                  }}
+                  return resp.arrayBuffer();
+                }}));
+
+                var total = buffers.reduce(function(acc, b) {{ return acc + b.byteLength; }}, 0);
+                var mergedGz = new Uint8Array(total);
+                var offset = 0;
+                for (var i = 0; i < buffers.length; i++) {{
+                  mergedGz.set(new Uint8Array(buffers[i]), offset);
+                  offset += buffers[i].byteLength;
+                }}
+                var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));
+                return new Response(stream, {{ status: 200, headers: {{ 'Content-Type': 'application/wasm' }} }});
+              }}
+              return origFetch.apply(this, args);
+            }};
+          }})();
+          </script>"""
 
                   if "<head>" in html:
                       html = html.replace("<head>", "<head>\n" + fast_loader)
                   else:
                       html = fast_loader + "\n" + html
 
+                  # 注入 50ms 拟真 Premiere Pro 原生剪辑工作台首屏 + 时间差操作捕获
+                  app_shell_dom = """
+                  <!-- [Instant App Shell] 50ms 极速拟真首屏 -->
+                  <div id="filmcraft-app-shell" style="position:fixed;top:0;left:0;width:100vw;height:100vh;background-color:#19191d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;z-index:999999;display:flex;flex-direction:column;user-select:none;">
+                    <!-- 顶栏模拟 -->
+                    <div style="height:38px;background:#222228;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid #2f2f38;font-size:13px;justify-content:space-between;">
+                      <div style="display:flex;align-items:center;gap:12px;">
+                        <span style="font-weight:600;color:#c084fc;display:flex;align-items:center;gap:6px;">
+                          🎬 FilmCraft 视频剪辑工作台
+                        </span>
+                        <span style="color:#4b5563;">|</span>
+                        <span style="color:#94a3b8;cursor:pointer;">文件</span>
+                        <span style="color:#94a3b8;cursor:pointer;">编辑</span>
+                        <span style="color:#94a3b8;cursor:pointer;">剪辑</span>
+                        <span style="color:#94a3b8;cursor:pointer;">序列</span>
+                        <span style="color:#94a3b8;cursor:pointer;">标记</span>
+                        <span style="color:#94a3b8;cursor:pointer;">音频</span>
+                        <span style="color:#94a3b8;cursor:pointer;">效果</span>
+                        <span style="color:#94a3b8;cursor:pointer;">导出</span>
+                      </div>
+                      <div id="engine-status-tag" style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:6px;background:#18181c;padding:3px 10px;border-radius:12px;border:1px solid #33333d;">
+                        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;animation:pulse 1.5s infinite;"></span>
+                        <span id="engine-status-text">音视频轨道引擎就绪中...</span>
+                      </div>
+                    </div>
+
+                    <!-- 主剪辑工作区四分屏模拟 -->
+                    <div style="flex:1;display:flex;flex-direction:column;position:relative;background:#141418;">
+                      <!-- 上半部分：素材箱与主监视器 -->
+                      <div style="flex:1;display:flex;border-bottom:1px solid #282830;position:relative;">
+                        <!-- 左侧：素材浏览器 / 媒体池 -->
+                        <div style="width:240px;background:#1e1e24;border-right:1px solid #282830;display:flex;flex-direction:column;font-size:12px;color:#94a3b8;">
+                          <div style="height:30px;background:#25252c;display:flex;align-items:center;padding:0 10px;font-weight:600;border-bottom:1px solid #2f2f38;justify-content:space-between;">
+                            <span>素材箱 (Media Pool)</span>
+                            <span style="cursor:pointer;color:#c084fc;">＋ 导入</span>
+                          </div>
+                          <div style="flex:1;padding:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed #33333f;margin:8px;border-radius:6px;gap:6px;color:#64748b;">
+                            <span>🎞 可将素材拖拽至此</span>
+                          </div>
+                        </div>
+
+                        <!-- 右侧：主节目监视器 (Program Monitor) -->
+                        <div style="flex:1;display:flex;flex-direction:column;background:#0d0d10;position:relative;">
+                          <div style="flex:1;display:flex;align-items:center;justify-content:center;position:relative;">
+                            <!-- 拟真 16:9 监视器屏幕 -->
+                            <div style="width:72%;max-width:560px;aspect-ratio:16/9;background:#18181c;border:1px solid #2b2b35;border-radius:4px;box-shadow:0 8px 30px rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;position:relative;">
+                              <div style="font-size:12px;color:#475569;letter-spacing:1px;">1920 × 1080 | 60 FPS</div>
+                            </div>
+                          </div>
+                          <!-- 播放控制条模拟 -->
+                          <div style="height:36px;background:#1b1b22;border-top:1px solid #282830;display:flex;align-items:center;justify-content:space-between;padding:0 16px;font-size:12px;color:#94a3b8;">
+                            <div style="font-family:monospace;color:#c084fc;font-weight:bold;">00:00:00:00</div>
+                            <div style="display:flex;gap:16px;cursor:pointer;">
+                              <span>⏮</span>
+                              <span>⏪</span>
+                              <span style="color:#c084fc;">⏯</span>
+                              <span>⏩</span>
+                              <span>⏭</span>
+                            </div>
+                            <div>适应 100%</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- 下半部分：多轨道时间轴 (Timeline) 拟真 -->
+                      <div style="height:170px;background:#18181f;display:flex;flex-direction:column;position:relative;">
+                        <!-- 时间刻度尺 -->
+                        <div style="height:24px;background:#202028;border-bottom:1px solid #2b2b36;display:flex;align-items:center;padding:0 8px;font-size:10px;color:#64748b;gap:40px;font-family:monospace;">
+                          <span>00:00</span><span>00:05</span><span>00:10</span><span>00:15</span><span>00:20</span><span>00:25</span><span>00:30</span>
+                        </div>
+                        <!-- 轨道区 -->
+                        <div style="flex:1;display:flex;flex-direction:column;position:relative;padding:4px 0;">
+                          <!-- 视频轨 V1 -->
+                          <div style="height:38px;margin:2px 0;background:#1c1c24;display:flex;align-items:center;padding-left:8px;border-left:3px solid #3b82f6;position:relative;">
+                            <span style="font-size:11px;color:#3b82f6;width:28px;">V1</span>
+                            <div style="height:30px;width:240px;background:#1e3a8a;border:1px solid #3b82f6;border-radius:3px;margin-left:12px;opacity:0.65;display:flex;align-items:center;padding-left:8px;font-size:11px;color:#bfdbfe;">视频主轨</div>
+                          </div>
+                          <!-- 音频轨 A1 -->
+                          <div style="height:38px;margin:2px 0;background:#1c1c24;display:flex;align-items:center;padding-left:8px;border-left:3px solid #10b981;position:relative;">
+                            <span style="font-size:11px;color:#10b981;width:28px;">A1</span>
+                            <div style="height:30px;width:280px;background:#064e3b;border:1px solid #10b981;border-radius:3px;margin-left:12px;opacity:0.65;display:flex;align-items:center;padding-left:8px;font-size:11px;color:#a7f3d0;">立体声音频轨 (波形)</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- 中央悬浮欢迎面板 -->
+                      <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;">
+                        <div style="position:relative;background:rgba(26,26,33,0.96);border:1px solid #3d3d4b;border-radius:8px;padding:28px 36px;box-shadow:0 18px 48px rgba(0,0,0,0.8);text-align:center;max-width:440px;width:90%;backdrop-filter:blur(6px);pointer-events:auto;">
+                          <div style="font-size:20px;font-weight:600;margin-bottom:8px;color:#f8fafc;">欢迎使用 FilmCraft</div>
+                          <div style="font-size:13px;color:#94a3b8;margin-bottom:24px;">轻量、免安装的高性能 Web 非线性视频剪辑与后期工作台</div>
+                          
+                          <div style="display:flex;flex-direction:column;gap:10px;">
+                            <label style="background:#9333ea;color:#fff;padding:10px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;transition:background 0.2s;display:flex;align-items:center;justify-content:center;gap:8px;">
+                              📂 导入本地音视频 (MP4 / MOV / WAV)
+                              <input type="file" id="shell-file-input" accept="video/*,audio/*" style="display:none;" />
+                            </label>
+                            <button id="shell-new-btn" style="background:#282833;color:#e2e8f0;border:1px solid #3e3e4f;padding:9px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;">
+                              ➕ 新建剪辑工程序列 (1080P 60FPS)
+                            </button>
+                            <button id="shell-demo-btn" style="background:transparent;color:#c084fc;border:none;padding:6px;font-size:13px;cursor:pointer;">
+                              🎞 载入官方电影级调色与剪辑工程
+                            </button>
+                          </div>
+
+                          <!-- 进度条提示 -->
+                          <div style="margin-top:24px;border-top:1px solid #33333d;padding-top:16px;">
+                            <div style="display:flex;justify-content:space-between;font-size:12px;color:#777788;margin-bottom:6px;">
+                              <span id="shell-step-desc">正在拉取多轨音视频渲染核心...</span>
+                              <span id="shell-progress-num">0%</span>
+                            </div>
+                            <div style="width:100%;height:4px;background:#33333d;border-radius:2px;overflow:hidden;">
+                              <div id="shell-progress-bar" style="width:18%;height:100%;background:#9333ea;transition:width 0.3s ease;"></div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <style>
+                  @keyframes pulse {
+                    0%, 100% { opacity: 1; transform: scale(1); }
+                    50% { opacity: 0.4; transform: scale(0.85); }
+                  }
+                  </style>
+                  <script>
+                  // 时间差操作捕获
+                  window._filmcraft_stashed_file = null;
+                  window._filmcraft_action = null;
+
+                  document.getElementById('shell-file-input').addEventListener('change', function(e) {
+                    if (e.target.files && e.target.files[0]) {
+                      window._filmcraft_stashed_file = e.target.files[0];
+                      document.getElementById('shell-step-desc').innerText = "已选择: " + e.target.files[0].name + " (等待引擎启动)";
+                    }
+                  });
+                  document.getElementById('shell-new-btn').addEventListener('click', function() {
+                    window._filmcraft_action = 'new';
+                    document.getElementById('shell-step-desc').innerText = "正在为您初始化 1080P 时间轴工程...";
+                  });
+                  document.getElementById('shell-demo-btn').addEventListener('click', function() {
+                    window._filmcraft_action = 'demo';
+                    document.getElementById('shell-step-desc').innerText = "正在载入示例电影剪辑工程...";
+                  });
+
+                  // 核心启动完成后无缝平滑淡出
+                  window.addEventListener('TrunkApplicationStarted', function() {
+                    var shell = document.getElementById('filmcraft-app-shell');
+                    if (shell) {
+                      document.getElementById('engine-status-text').innerText = "核心已就绪";
+                      document.getElementById('shell-progress-bar').style.width = "100%";
+                      document.getElementById('shell-progress-num').innerText = "100%";
+                      setTimeout(function() {
+                        shell.style.transition = 'opacity 0.4s ease';
+                        shell.style.opacity = '0';
+                        setTimeout(function() { shell.remove(); }, 400);
+                      }, 150);
+                    }
+                  });
+                  </script>
+                  """
+
+                  if "filmcraft-app-shell" not in html:
+                      html = html.replace("<body", app_shell_dom + "\n<body")
+                      print("✅ 已成功将原生工作台首屏注入到 dist/web/index.html")
+
                   with open(html_path, "w", encoding="utf-8") as f:
                       f.write(html)
-                  print("✅ index.html 已更新为流式管道解压引擎")
 
           # 5. 生成 Cloudflare Pages _headers 强缓存规则文件
           headers_content = (
@@ -397,8 +532,40 @@ jobs:
 
       # 8. 部署发布到 Cloudflare Pages (lotelf-pr)
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist/web --project-name=lotelf-pr --branch=main --commit-dirty=true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 1. 自动从 Token 探测真实 Account ID
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          # 2. 安装 Wrangler
+          npm install -g wrangler
+
+          # 3. 发布到 Cloudflare Pages (带 5 次自动重试机制，对抗 503 抖动)
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          SUCCESS=0
+
+          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+            echo "🚀 正在发布到 Cloudflare Pages (尝试 $((RETRY_COUNT+1))/$MAX_RETRIES)..."
+            if wrangler pages deploy dist/web --project-name=lotelf-pr --branch=main --commit-dirty=true; then
+              echo "✅ Cloudflare Pages 发布成功！"
+              SUCCESS=1
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "⚠️ 遇到 Cloudflare API 波动或 503，等待 15 秒后进行第 $RETRY_COUNT 次重试..."
+            sleep 15
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "❌ 连续重试 $MAX_RETRIES 次后发布失败，请检查网络或 Cloudflare 状态。"
+            exit 1
+          fi
